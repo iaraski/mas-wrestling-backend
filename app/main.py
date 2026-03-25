@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import time
+from fastapi.responses import JSONResponse
 import httpx
 
 # Import routers
@@ -15,7 +16,7 @@ async def lifespan(app: FastAPI):
     # Shutdown
     print("🛑 [FastAPI] Server is shutting down...")
 
-app = FastAPI(title="CompEaseBot API", lifespan=lifespan)
+app = FastAPI(title="CompEaseBot API", lifespan=lifespan,default_response_class=JSONResponse)
 
 # Setup CORS
 origins = [
