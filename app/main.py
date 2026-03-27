@@ -1,9 +1,9 @@
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
-import time
 from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
 import httpx
+import time
 
 # Import routers
 from app.routers import competition, application, brackets, user, locations, bouts
@@ -64,6 +64,29 @@ try:
     print("ROUTERS CONNECTED SUCCESSFULLY")
 except Exception as e:
     print(f"Error connecting routers: {e}")
+
+from app.core.telegram import BOT_TOKEN
+
+@app.get("/api/v1/tg-file/{file_id}")
+async def get_telegram_file(file_id: str):
+    if not BOT_TOKEN:
+        raise HTTPException(status_code=500, detail="BOT_TOKEN is not configured")
+        
+    async with httpx.AsyncClient() as client:
+        # 1. Get file path from Telegram API
+        resp = await client.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}")
+        data = resp.json()
+        
+        if not data.get("ok"):
+            raise HTTPException(status_code=404, detail="File not found in Telegram")
+            
+        file_path = data["result"]["file_path"]
+        
+        # 2. Proxy the file content
+        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        file_resp = await client.get(file_url)
+        
+        return Response(content=file_resp.content, media_type=file_resp.headers.get("content-type"))
 
 @app.get("/")
 async def root():
