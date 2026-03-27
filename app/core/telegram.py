@@ -6,10 +6,10 @@ from typing import Optional
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
-    print("⚠️ [Telegram Core] WARNING: BOT_TOKEN is not set in environment variables!")
+    print("[Telegram Core] WARNING: BOT_TOKEN is not set in environment variables!")
 else:
     masked = f"{BOT_TOKEN[:5]}...{BOT_TOKEN[-5:]}" if len(BOT_TOKEN) > 10 else "***"
-    print(f"✅ [Telegram Core] BOT_TOKEN loaded: {masked}")
+    print(f"[Telegram Core] BOT_TOKEN loaded: {masked}")
 
 async def get_telegram_file_url(file_id: str) -> Optional[str]:
     if not BOT_TOKEN:

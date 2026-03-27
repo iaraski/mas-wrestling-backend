@@ -11,10 +11,10 @@ from app.routers import competition, application, brackets, user, locations, bou
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    print("🚀 [FastAPI] Server is starting up...")
+    print("[FastAPI] Server is starting up...")
     yield
     # Shutdown
-    print("🛑 [FastAPI] Server is shutting down...")
+    print("[FastAPI] Server is shutting down...")
 
 app = FastAPI(title="CompEaseBot API", lifespan=lifespan,default_response_class=JSONResponse)
 
@@ -41,16 +41,16 @@ app.add_middleware(
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
     start_time = time.time()
-    print(f"🚀 ИНКОМИНГ: {request.method} {request.url.path}")
+    print(f"INCOMING: {request.method} {request.url.path}")
     
     try:
         response = await call_next(request)
         process_time = time.time() - start_time
         response.headers["X-Process-Time"] = str(process_time)
-        print(f"✅ СТАТУС: {response.status_code} ({process_time:.4f}s)")
+        print(f"STATUS: {response.status_code} ({process_time:.4f}s)")
         return response
     except Exception as e:
-        print(f"❌ ОШИБКА: {e}")
+        print(f"ERROR: {e}")
         raise e
 
 # Include routers
@@ -61,10 +61,14 @@ try:
     app.include_router(user.router)
     app.include_router(locations.router)
     app.include_router(bouts.router)
-    print("📦 РОУТЕРЫ ПОДКЛЮЧЕНЫ УСПЕШНО")
+    print("ROUTERS CONNECTED SUCCESSFULLY")
 except Exception as e:
-    print(f"❌ Ошибка подключения роутеров: {e}")
+    print(f"Error connecting routers: {e}")
 
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "CompEaseBot API is running"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app.main:app", host="127.0.0.1", port=8000, reload=True)
