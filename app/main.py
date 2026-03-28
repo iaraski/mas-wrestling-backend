@@ -67,7 +67,7 @@ except Exception as e:
 
 from app.core.telegram import BOT_TOKEN
 
-@app.get("/api/v1/tg-file/{file_id}")
+@app.get("/api/v1/tg-file/{file_id:path}")
 async def get_telegram_file(file_id: str):
     if not BOT_TOKEN:
         raise HTTPException(status_code=500, detail="BOT_TOKEN is not configured")
