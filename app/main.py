@@ -72,6 +72,10 @@ async def get_telegram_file(file_id: str):
     if not BOT_TOKEN:
         raise HTTPException(status_code=500, detail="BOT_TOKEN is not configured")
         
+    # Remove leading slash if it was accidentally captured by :path
+    if file_id.startswith('/'):
+        file_id = file_id[1:]
+        
     async with httpx.AsyncClient() as client:
         # 1. Get file path from Telegram API
         resp = await client.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}")
@@ -86,7 +90,12 @@ async def get_telegram_file(file_id: str):
         file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
         file_resp = await client.get(file_url)
         
-        return Response(content=file_resp.content, media_type=file_resp.headers.get("content-type"))
+        # Remove Content-Disposition header if it forces download
+        headers = dict(file_resp.headers)
+        if "content-disposition" in headers:
+            del headers["content-disposition"]
+            
+        return Response(content=file_resp.content, media_type=headers.get("content-type"), headers=headers)
 
 @app.get("/")
 async def root():
