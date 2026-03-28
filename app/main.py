@@ -80,7 +80,8 @@ async def get_telegram_file(file_id: str):
         
     async with httpx.AsyncClient() as client:
         # 1. Get file path from Telegram API
-        resp = await client.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}")
+        # Need to URL encode the file_id properly or pass it as params to httpx
+        resp = await client.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile", params={"file_id": file_id})
         data = resp.json()
         
         print(f"Telegram API response: {data}")
