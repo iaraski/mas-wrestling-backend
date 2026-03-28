@@ -76,10 +76,14 @@ async def get_telegram_file(file_id: str):
     if file_id.startswith('/'):
         file_id = file_id[1:]
         
+    print(f"Proxying file_id: {file_id}")
+        
     async with httpx.AsyncClient() as client:
         # 1. Get file path from Telegram API
         resp = await client.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}")
         data = resp.json()
+        
+        print(f"Telegram API response: {data}")
         
         if not data.get("ok"):
             raise HTTPException(status_code=404, detail="File not found in Telegram")
@@ -99,7 +103,13 @@ async def get_telegram_file(file_id: str):
         elif file_path.lower().endswith(".pdf"):
             content_type = "application/pdf"
             
-        return Response(content=file_resp.content, media_type=content_type)
+        # Add explicit headers to force inline display instead of download
+        headers = {
+            "Content-Type": content_type,
+            "Content-Disposition": "inline"
+        }
+            
+        return Response(content=file_resp.content, media_type=content_type, headers=headers)
 
 @app.get("/")
 async def root():
