@@ -90,12 +90,16 @@ async def get_telegram_file(file_id: str):
         file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
         file_resp = await client.get(file_url)
         
-        # Remove Content-Disposition header if it forces download
-        headers = dict(file_resp.headers)
-        if "content-disposition" in headers:
-            del headers["content-disposition"]
+        # Determine content type based on extension
+        content_type = "application/octet-stream"
+        if file_path.lower().endswith((".jpg", ".jpeg")):
+            content_type = "image/jpeg"
+        elif file_path.lower().endswith(".png"):
+            content_type = "image/png"
+        elif file_path.lower().endswith(".pdf"):
+            content_type = "application/pdf"
             
-        return Response(content=file_resp.content, media_type=headers.get("content-type"), headers=headers)
+        return Response(content=file_resp.content, media_type=content_type)
 
 @app.get("/")
 async def root():
