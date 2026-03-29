@@ -6,7 +6,7 @@ import httpx
 import time
 
 # Import routers
-from app.routers import competition, application, brackets, user, locations, bouts
+from app.routers import competition, application, brackets, user, locations, bouts, auth
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -61,6 +61,7 @@ try:
     app.include_router(user.router)
     app.include_router(locations.router)
     app.include_router(bouts.router)
+    app.include_router(auth.router)
     print("ROUTERS CONNECTED SUCCESSFULLY")
 except Exception as e:
     print(f"Error connecting routers: {e}")
