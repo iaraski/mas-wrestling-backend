@@ -45,13 +45,13 @@ async def add_process_time_header(request: Request, call_next):
 
 # Include routers
 try:
-    app.include_router(competition.router)
-    app.include_router(application.router)
-    app.include_router(brackets.router)
-    app.include_router(user.router)
-    app.include_router(locations.router)
-    app.include_router(bouts.router)
-    app.include_router(auth.router)
+    app.include_router(competition.router, prefix="/api/v1")
+    app.include_router(application.router, prefix="/api/v1")
+    app.include_router(brackets.router, prefix="/api/v1")
+    app.include_router(user.router, prefix="/api/v1")
+    app.include_router(locations.router, prefix="/api/v1")
+    app.include_router(bouts.router, prefix="/api/v1")
+    app.include_router(auth.router, prefix="/api/v1")
     print("ROUTERS CONNECTED SUCCESSFULLY")
 except Exception as e:
     print(f"Error connecting routers: {e}")
