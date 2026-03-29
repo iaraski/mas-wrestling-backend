@@ -19,12 +19,19 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="CompEaseBot API", lifespan=lifespan,default_response_class=JSONResponse)
 
 # Setup CORS
+origins = [
+    "http://localhost:5173",
+    "http://localhost",
+    "https://mas-wrestling.pro",
+    "https://api.mas-wrestling.pro"
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
-    allow_credentials=False,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Request Timing Middleware
