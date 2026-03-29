@@ -6,7 +6,7 @@ from app.schemas.user import Role, UserProfile, RoleAssign, AdminCreate, Profile
 
 router = APIRouter(prefix="/users", tags=["users"])
 
-@router.get("/me/profile", response_model=dict)
+@router.get("/me/profile")
 async def get_my_profile(user_id: str):
     res = supabase.table("profiles").select("*, location:locations(id, name, parent:locations(id, name, parent:locations(id, name)))").eq("user_id", user_id).maybe_single().execute()
     if not res.data:

@@ -42,11 +42,13 @@ async def get_me(authorization: str | None = Header(default=None)):
         role_codes = [
             ur.get("roles", {}).get("code")
             for ur in res.data.get("user_roles", [])
-            if ur.get("roles") and ur.get("roles", {}).get("code")
+            if ur and ur.get("roles") and ur.get("roles", {}).get("code")
         ]
+        
+    print(f"User {user_id} roles: {role_codes}")
 
-    is_admin = any("admin" in c for c in role_codes)
-    is_secretary = any("secretary" in c for c in role_codes)
+    is_admin = any(c == "admin" for c in role_codes)
+    is_secretary = any(c == "secretary" for c in role_codes)
 
     primary_role = "athlete"
     if is_admin:
