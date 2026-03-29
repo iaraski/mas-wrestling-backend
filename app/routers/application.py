@@ -219,6 +219,27 @@ async def create_application(app_in: ApplicationCreate):
         raise HTTPException(status_code=400, detail="Failed to create application")
     return res.data[0]
 
+@router.post("/me")
+async def create_my_application(user_id: str, category_id: str):
+    athlete_res = supabase.table("athletes").select("id").eq("user_id", user_id).maybe_single().execute()
+    if not athlete_res.data:
+        raise HTTPException(status_code=404, detail="Athlete not found")
+        
+    athlete_id = athlete_res.data["id"]
+    
+    # Check if already applied
+    existing = supabase.table("applications").select("id").eq("athlete_id", athlete_id).eq("category_id", category_id).execute()
+    if existing.data:
+        raise HTTPException(status_code=400, detail="Already applied to this category")
+        
+    res = supabase.table("applications").insert({
+        "athlete_id": athlete_id,
+        "category_id": category_id,
+        "status": "pending"
+    }).execute()
+    
+    return res.data[0]
+
 @router.patch("/{app_id}/", response_model=Application)
 @router.patch("/{app_id}", response_model=Application)
 async def update_application_status(app_id: UUID, app_update: ApplicationUpdate):

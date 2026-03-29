@@ -13,7 +13,7 @@ class Location(BaseModel):
     parent_id: Optional[UUID] = None
 
 @router.get("/", response_model=List[Location])
-async def get_locations(type: Optional[str] = None, parent_id: Optional[UUID] = None):
+async def get_locations(type: Optional[str] = None, parent_id: Optional[str] = None):
     query = supabase.table("locations").select("*")
     if type:
         query = query.eq("type", type)

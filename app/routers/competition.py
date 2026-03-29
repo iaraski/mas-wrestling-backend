@@ -7,6 +7,11 @@ from app.schemas.competition import Competition, CompetitionCreate, CompetitionU
 
 router = APIRouter(prefix="/competitions", tags=["competitions"])
 
+@router.get("/active")
+async def get_active_competitions():
+    res = supabase.table("competitions").select("*, categories:competition_categories(*)").gte("end_date", datetime.now().isoformat()).order("start_date", desc=False).execute()
+    return res.data
+
 @router.get("/", response_model=List[Competition])
 async def get_competitions():
     # Получаем соревнования с их категориями и названием локации

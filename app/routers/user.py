@@ -1,10 +1,93 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from typing import List, Optional
 from uuid import UUID
 from app.core.supabase import supabase, admin_supabase
-from app.schemas.user import Role, UserProfile, RoleAssign, AdminCreate
+from app.schemas.user import Role, UserProfile, RoleAssign, AdminCreate, ProfileResponse, ProfileCreate, PassportResponse, PassportBase, AthleteResponse
 
 router = APIRouter(prefix="/users", tags=["users"])
+
+@router.get("/me/profile", response_model=dict)
+async def get_my_profile(user_id: str):
+    res = supabase.table("profiles").select("*, location:locations(id, name, parent:locations(id, name, parent:locations(id, name)))").eq("user_id", user_id).maybe_single().execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return res.data
+
+@router.put("/me/profile", response_model=ProfileResponse)
+async def update_my_profile(user_id: str, profile: ProfileCreate):
+    res = supabase.table("profiles").upsert(
+        {
+            "user_id": user_id,
+            "full_name": profile.full_name,
+            "phone": profile.phone,
+            "location_id": profile.location_id,
+            "city": profile.city,
+        },
+        on_conflict="user_id"
+    ).execute()
+    return res.data[0]
+
+@router.get("/me/athlete", response_model=AthleteResponse)
+async def get_my_athlete(user_id: str):
+    res = supabase.table("athletes").select("*, passports(*)").eq("user_id", user_id).maybe_single().execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Athlete not found")
+    return res.data
+
+@router.put("/me/athlete")
+async def update_my_athlete(user_id: str, coach_name: Optional[str] = None):
+    res = supabase.table("athletes").upsert(
+        {
+            "user_id": user_id,
+            "coach_name": coach_name,
+        },
+        on_conflict="user_id"
+    ).execute()
+    return res.data[0]
+
+@router.put("/me/passport", response_model=PassportResponse)
+async def update_my_passport(user_id: str, passport: PassportBase):
+    # Get athlete ID first
+    athlete_res = supabase.table("athletes").select("id").eq("user_id", user_id).maybe_single().execute()
+    if not athlete_res.data:
+        raise HTTPException(status_code=404, detail="Athlete profile must be created first")
+    
+    athlete_id = athlete_res.data["id"]
+    
+    # Check if verified
+    existing_passport = supabase.table("passports").select("is_verified").eq("athlete_id", athlete_id).maybe_single().execute()
+    if existing_passport.data and existing_passport.data.get("is_verified"):
+        raise HTTPException(status_code=403, detail="Passport is verified and cannot be edited")
+
+    res = supabase.table("passports").upsert(
+        {
+            "athlete_id": athlete_id,
+            "series": passport.series,
+            "number": passport.number,
+            "issued_by": passport.issued_by,
+            "issue_date": str(passport.issue_date),
+            "birth_date": str(passport.birth_date),
+            "gender": passport.gender,
+            "rank": passport.rank,
+            "photo_url": passport.photo_url,
+            "passport_scan_url": passport.passport_scan_url,
+        },
+        on_conflict="athlete_id"
+    ).execute()
+    return res.data[0]
+
+@router.get("/me/applications")
+async def get_my_applications(user_id: str):
+    athlete_res = supabase.table("athletes").select("id").eq("user_id", user_id).maybe_single().execute()
+    if not athlete_res.data:
+        return []
+    
+    athlete_id = athlete_res.data["id"]
+    res = supabase.table("applications").select(
+        "id, status, draw_number, created_at, category_id, competitions(id, name, start_date), competition_categories(gender, age_min, age_max, weight_min, weight_max)"
+    ).eq("athlete_id", athlete_id).order("created_at", desc=True).execute()
+    
+    return res.data
 
 @router.post("/admin-create/", response_model=UserProfile)
 @router.post("/admin-create", response_model=UserProfile)
