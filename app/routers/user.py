@@ -10,7 +10,8 @@ router = APIRouter(prefix="/users", tags=["users"])
 async def get_my_profile(user_id: str):
     res = supabase.table("profiles").select("*, location:locations(id, name, parent:locations(id, name, parent:locations(id, name)))").eq("user_id", user_id).maybe_single().execute()
     if not res.data:
-        raise HTTPException(status_code=404, detail="Profile not found")
+        # Return empty profile instead of 404
+        return {"user_id": user_id, "full_name": "", "phone": "", "city": "", "location_id": None}
     return res.data
 
 @router.put("/me/profile", response_model=ProfileResponse)
@@ -31,7 +32,8 @@ async def update_my_profile(user_id: str, profile: ProfileCreate):
 async def get_my_athlete(user_id: str):
     res = supabase.table("athletes").select("*, passports(*)").eq("user_id", user_id).maybe_single().execute()
     if not res.data:
-        raise HTTPException(status_code=404, detail="Athlete not found")
+        # Return a dummy response instead of 404 so admins don't crash when visiting dashboard
+        return {"id": "00000000-0000-0000-0000-000000000000", "user_id": user_id, "coach_name": "", "passports": []}
     return res.data
 
 @router.put("/me/athlete")
