@@ -28,7 +28,7 @@ async def update_my_profile(user_id: str, profile: ProfileCreate):
     ).execute()
     return res.data[0]
 
-@router.get("/me/athlete", response_model=AthleteResponse)
+@router.get("/me/athlete")
 async def get_my_athlete(user_id: str):
     res = supabase.table("athletes").select("*, passports(*)").eq("user_id", user_id).maybe_single().execute()
     if not res.data:
