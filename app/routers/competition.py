@@ -204,7 +204,7 @@ async def upload_competition_preview(comp_id: UUID, file: UploadFile = File(...)
         )
 
         preview_url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{object_path}"
-        admin_supabase.table("competitions").update({"preview_url": preview_url}).eq("id", str(comp_id)).execute()
+        supabase.table("competitions").update({"preview_url": preview_url}).eq("id", str(comp_id)).execute()
         return {"preview_url": preview_url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
