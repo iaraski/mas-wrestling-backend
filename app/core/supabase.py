@@ -23,6 +23,15 @@ if SUPABASE_SERVICE_ROLE_KEY:
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError(f"SUPABASE_URL and SUPABASE_KEY must be set in .env. Checked path: {env_path}")
 
+SUPABASE_URL = SUPABASE_URL.strip().rstrip("/")
+if SUPABASE_URL.endswith("/rest/v1"):
+    SUPABASE_URL = SUPABASE_URL[: -len("/rest/v1")]
+if SUPABASE_URL.endswith("/auth/v1"):
+    SUPABASE_URL = SUPABASE_URL[: -len("/auth/v1")]
+
+if "/api/v1" in SUPABASE_URL:
+    raise ValueError("SUPABASE_URL must be the Supabase project URL (https://<ref>.supabase.co), not the backend API URL")
+
 try:
     # Настраиваем кастомный HTTP-клиент для обхода ошибки SSL: UNEXPECTED_EOF_WHILE_READING
     # Отключаем http2 и жестко ограничиваем время жизни keepalive-соединений
