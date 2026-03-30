@@ -47,8 +47,8 @@ async def get_me(authorization: str | None = Header(default=None)):
         
     print(f"User {user_id} roles: {role_codes}")
 
-    is_admin = any(c == "admin" for c in role_codes)
-    is_secretary = any(c == "secretary" for c in role_codes)
+    is_admin = any(c in ["admin", "founder", "country_admin", "region_admin", "country_secretary", "region_secretary"] for c in role_codes)
+    is_secretary = any(c in ["secretary", "country_secretary", "region_secretary"] for c in role_codes)
 
     primary_role = "athlete"
     if is_admin:
