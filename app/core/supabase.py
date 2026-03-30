@@ -28,13 +28,14 @@ try:
     # Отключаем http2 и жестко ограничиваем время жизни keepalive-соединений
     custom_httpx_client = httpx.Client(
         http2=False,
-        limits=httpx.Limits(max_keepalive_connections=5, keepalive_expiry=5.0),
-        timeout=10.0
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10, keepalive_expiry=10.0),
+        transport=httpx.HTTPTransport(retries=3),
+        timeout=30.0
     )
     
     opts = ClientOptions(
         httpx_client=custom_httpx_client,
-        postgrest_client_timeout=10
+        postgrest_client_timeout=30
     )
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=opts)
 except Exception as e:

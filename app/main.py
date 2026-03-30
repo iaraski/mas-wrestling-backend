@@ -47,8 +47,9 @@ async def add_process_time_header(request: Request, call_next):
         print(f"STATUS: {response.status_code} ({process_time:.4f}s)")
         return response
     except Exception as e:
-        print(f"ERROR: {e}")
-        raise e
+        process_time = time.time() - start_time
+        print(f"ERROR: {repr(e)} ({process_time:.4f}s)")
+        return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
 # Include routers
 try:
