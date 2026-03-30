@@ -1,9 +1,17 @@
-from fastapi import APIRouter, HTTPException, Header, Body
+from fastapi import APIRouter, HTTPException, Header, Body, Query
+from fastapi.responses import RedirectResponse
 from app.core.supabase import SUPABASE_URL, SUPABASE_KEY, SUPABASE_SERVICE_ROLE_KEY, admin_supabase
+from app.core.telegram import send_telegram_notification
 import httpx
+import os
 import secrets
+import hmac
+import hashlib
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+TG_CONFIRM_SECRET = os.getenv("TG_CONFIRM_SECRET", "")
+PUBLIC_WEB_URL = os.getenv("PUBLIC_WEB_URL", "https://mas-wrestling.pro")
 
 def _require_service_role():
     if not admin_supabase or not SUPABASE_SERVICE_ROLE_KEY:
@@ -53,6 +61,32 @@ async def _get_auth_admin_user(user_id: str) -> dict:
 
 def _is_email_confirmed(auth_user: dict) -> bool:
     return bool(auth_user.get("email_confirmed_at") or auth_user.get("confirmed_at"))
+
+def _sign_tg_confirm(telegram_id: int, email: str) -> str:
+    if not TG_CONFIRM_SECRET:
+        return ""
+    msg = f"{telegram_id}|{email}".encode("utf-8")
+    return hmac.new(TG_CONFIRM_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+def _check_tg_confirm_sig(telegram_id: int, email: str, sig: str | None) -> bool:
+    if not TG_CONFIRM_SECRET:
+        return True
+    if not sig:
+        return False
+    expected = _sign_tg_confirm(telegram_id, email)
+    return hmac.compare_digest(expected, sig)
+
+async def _get_auth_user_by_email(email: str) -> dict | None:
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{SUPABASE_URL}/auth/v1/admin/users",
+            headers={"Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}", "apikey": SUPABASE_KEY},
+            params={"email": email},
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    users_list = resp.json().get("users", [])
+    return users_list[0] if users_list else None
 
 @router.get("/me")
 async def get_me(authorization: str | None = Header(default=None)):
@@ -121,7 +155,7 @@ async def bot_signup(
     telegram_id: int | None = Body(None),
 ):
     _require_service_role()
-    user_id = _resolve_user_id(user_id=user_id, telegram_id=telegram_id)
+    db_user_id = _resolve_user_id(user_id=user_id, telegram_id=telegram_id)
 
     async with httpx.AsyncClient() as client:
         create_resp = await client.post(
@@ -131,12 +165,7 @@ async def bot_signup(
                 "apikey": SUPABASE_KEY,
                 "Content-Type": "application/json",
             },
-            json={
-                "id": user_id,
-                "email": email,
-                "password": password,
-                "email_confirm": False,
-            },
+            json={"email": email, "password": password, "email_confirm": False},
         )
         if create_resp.status_code not in (200, 201):
             # 422 means user already exists
@@ -156,7 +185,7 @@ async def bot_signup(
             print("[auth/bot-signup] resend failed", resend_resp.status_code, resend_resp.text)
 
     # Store email on our side too
-    admin_supabase.table("users").update({"email": email}).eq("id", user_id).execute()
+    admin_supabase.table("users").update({"email": email}).eq("id", db_user_id).execute()
 
     return {"ok": True}
 
@@ -190,10 +219,23 @@ async def bot_init_email(
         if create_resp.status_code not in (200, 201, 422):
             raise HTTPException(status_code=create_resp.status_code, detail=create_resp.text)
 
+        redirect_to = None
+        if telegram_id is not None:
+            sig = _sign_tg_confirm(telegram_id, email)
+            redirect_to = (
+                f"{os.getenv('PUBLIC_API_URL', 'https://api.mas-wrestling.pro')}/api/v1/auth/tg-email-confirmed"
+                f"?telegram_id={telegram_id}&email={email}&sig={sig}"
+            )
+
         resend_resp = await client.post(
             f"{SUPABASE_URL}/auth/v1/resend",
             headers={"apikey": SUPABASE_KEY, "Content-Type": "application/json"},
-            json={"type": "signup", "email": email},
+            json={
+                "type": "signup",
+                "email": email,
+                "redirectTo": redirect_to,
+                "redirect_to": redirect_to,
+            },
         )
         if resend_resp.status_code not in (200, 201, 204):
             print("[auth/bot-init-email] resend failed", resend_resp.status_code, resend_resp.text)
@@ -346,8 +388,11 @@ async def bot_update_email(
 
 @router.post("/bot-resend-confirmation")
 async def bot_resend_confirmation(
-    email: str = Body(...),
+    payload: dict = Body(...),
 ):
+    email = payload.get("email")
+    if not email:
+        raise HTTPException(status_code=422, detail="email is required")
     async with httpx.AsyncClient() as client:
         r = await client.post(
             f"{SUPABASE_URL}/auth/v1/resend",
@@ -357,3 +402,27 @@ async def bot_resend_confirmation(
     if r.status_code not in (200, 201, 204):
         raise HTTPException(status_code=r.status_code, detail=r.text)
     return {"ok": True}
+
+@router.get("/tg-email-confirmed")
+async def tg_email_confirmed(
+    telegram_id: int = Query(...),
+    email: str = Query(...),
+    sig: str | None = Query(None),
+):
+    _require_service_role()
+    if not _check_tg_confirm_sig(telegram_id, email, sig):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+    auth_user = await _get_auth_user_by_email(email)
+    if not auth_user or not _is_email_confirmed(auth_user):
+        return RedirectResponse(f"{PUBLIC_WEB_URL}/auth/verified")
+
+    await send_telegram_notification(
+        telegram_id,
+        "✅ Email подтвержден. Нажмите кнопку ниже, чтобы продолжить регистрацию.",
+        reply_markup={
+            "inline_keyboard": [[{"text": "Продолжить регистрацию", "callback_data": "email_continue"}]],
+        },
+    )
+
+    return RedirectResponse(f"{PUBLIC_WEB_URL}/auth/verified")

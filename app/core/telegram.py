@@ -1,6 +1,6 @@
 import os
 import httpx
-from typing import Optional
+from typing import Optional, Any
 
 # This will be evaluated when the module is imported
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -32,17 +32,20 @@ async def get_telegram_file_url(file_id: str) -> Optional[str]:
         except Exception as e:
             print(f"[Telegram API] Error: {e}")
             
-async def send_telegram_notification(chat_id: int, text: str):
+async def send_telegram_notification(chat_id: int, text: str, reply_markup: Any | None = None):
     if not BOT_TOKEN:
         print("[Telegram Notification] ERROR: BOT_TOKEN is not set!")
         return
     
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
+    payload: dict[str, Any] = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML"
     }
+
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     
     async with httpx.AsyncClient(timeout=15.0, http2=False) as client:
         try:
