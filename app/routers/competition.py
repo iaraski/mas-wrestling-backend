@@ -4,7 +4,7 @@ from uuid import UUID
 from datetime import datetime
 from uuid import uuid4
 import os
-from app.core.supabase import supabase, admin_supabase, SUPABASE_URL
+from app.core.supabase import supabase, admin_supabase, SUPABASE_URL, SUPABASE_KEY, SUPABASE_SERVICE_ROLE_KEY
 from app.schemas.competition import Competition, CompetitionCreate, CompetitionUpdate
 
 router = APIRouter(prefix="/competitions", tags=["competitions"])
@@ -188,7 +188,7 @@ async def upload_competition_preview(comp_id: UUID, file: UploadFile = File(...)
             else:
                 ext = ".jpg"
 
-        object_path = f"{comp_id}/preview"
+        object_path = f"{comp_id}/preview{ext}"
         content = await file.read()
 
         if not content:
@@ -198,7 +198,15 @@ async def upload_competition_preview(comp_id: UUID, file: UploadFile = File(...)
             raise HTTPException(status_code=413, detail="File too large (max 10MB)")
 
         try:
-            admin_supabase.storage.from_(bucket).remove([object_path])
+            admin_supabase.storage.from_(bucket).remove(
+                [
+                    f"{comp_id}/preview.jpg",
+                    f"{comp_id}/preview.jpeg",
+                    f"{comp_id}/preview.png",
+                    f"{comp_id}/preview.webp",
+                    f"{comp_id}/preview",
+                ]
+            )
         except Exception:
             pass
 
@@ -209,6 +217,23 @@ async def upload_competition_preview(comp_id: UUID, file: UploadFile = File(...)
         )
 
         preview_url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{object_path}"
+        if not SUPABASE_SERVICE_ROLE_KEY or not SUPABASE_KEY:
+            raise HTTPException(status_code=500, detail="Supabase keys not configured")
+
+        async with httpx.AsyncClient(timeout=20.0, http2=False) as client:
+            resp = await client.patch(
+                f"{SUPABASE_URL}/rest/v1/competitions",
+                params={"id": f"eq.{str(comp_id)}"},
+                headers={
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                    "apikey": SUPABASE_KEY,
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+                json={"preview_url": preview_url},
+            )
+        if resp.status_code not in (200, 204):
+            raise HTTPException(status_code=500, detail=f"Failed to update preview_url: {resp.status_code} {resp.text}")
         return {"preview_url": preview_url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
