@@ -188,7 +188,7 @@ async def upload_competition_preview(comp_id: UUID, file: UploadFile = File(...)
             else:
                 ext = ".jpg"
 
-        object_path = f"{comp_id}/{uuid4().hex}{ext}"
+        object_path = f"{comp_id}/preview"
         content = await file.read()
 
         if not content:
@@ -197,6 +197,11 @@ async def upload_competition_preview(comp_id: UUID, file: UploadFile = File(...)
         if len(content) > 10 * 1024 * 1024:
             raise HTTPException(status_code=413, detail="File too large (max 10MB)")
 
+        try:
+            admin_supabase.storage.from_(bucket).remove([object_path])
+        except Exception:
+            pass
+
         admin_supabase.storage.from_(bucket).upload(
             object_path,
             content,
@@ -204,7 +209,6 @@ async def upload_competition_preview(comp_id: UUID, file: UploadFile = File(...)
         )
 
         preview_url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{object_path}"
-        supabase.table("competitions").update({"preview_url": preview_url}).eq("id", str(comp_id)).execute()
         return {"preview_url": preview_url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
