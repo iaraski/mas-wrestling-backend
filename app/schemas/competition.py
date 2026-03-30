@@ -45,6 +45,7 @@ class CompetitionBase(BaseModel):
     scale: str # world, country, region
     type: str # open, restricted
     location_id: Optional[UUID] = None # Это ID региона или страны
+    preview_url: Optional[str] = None
     city: Optional[str] = None
     street: Optional[str] = None
     house: Optional[str] = None
@@ -63,6 +64,7 @@ class CompetitionUpdate(BaseModel):
     scale: Optional[str] = None
     type: Optional[str] = None
     location_id: Optional[UUID] = None
+    preview_url: Optional[str] = None
     city: Optional[str] = None
     street: Optional[str] = None
     house: Optional[str] = None
