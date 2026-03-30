@@ -42,6 +42,7 @@ class Bracket(BaseModel):
 # 2. Схемы для Соревнований
 class CompetitionBase(BaseModel):
     name: str
+    description: Optional[str] = None
     scale: str # world, country, region
     type: str # open, restricted
     location_id: Optional[UUID] = None # Это ID региона или страны
@@ -61,6 +62,7 @@ class CompetitionCreate(CompetitionBase):
 
 class CompetitionUpdate(BaseModel):
     name: Optional[str] = None
+    description: Optional[str] = None
     scale: Optional[str] = None
     type: Optional[str] = None
     location_id: Optional[UUID] = None
