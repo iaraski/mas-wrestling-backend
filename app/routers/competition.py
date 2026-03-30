@@ -171,6 +171,12 @@ async def update_competition(comp_id: UUID, comp_update: CompetitionUpdate):
 @router.post("/{comp_id}/preview")
 async def upload_competition_preview(comp_id: UUID, file: UploadFile = File(...)):
     try:
+        if not admin_supabase:
+            raise HTTPException(status_code=500, detail="Service role not configured for uploads")
+
+        if not file.content_type or not file.content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="Only image files are supported")
+
         bucket = os.getenv("SUPABASE_COMPETITION_PREVIEW_BUCKET", "competition-previews")
         filename = file.filename or "preview"
         ext = os.path.splitext(filename)[1].lower()
@@ -185,15 +191,20 @@ async def upload_competition_preview(comp_id: UUID, file: UploadFile = File(...)
         object_path = f"{comp_id}/{uuid4().hex}{ext}"
         content = await file.read()
 
-        client = admin_supabase or supabase
-        client.storage.from_(bucket).upload(
+        if not content:
+            raise HTTPException(status_code=400, detail="Empty file")
+
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="File too large (max 10MB)")
+
+        admin_supabase.storage.from_(bucket).upload(
             object_path,
             content,
             file_options={"content-type": file.content_type or "application/octet-stream"},
         )
 
         preview_url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{object_path}"
-        supabase.table("competitions").update({"preview_url": preview_url}).eq("id", str(comp_id)).execute()
+        admin_supabase.table("competitions").update({"preview_url": preview_url}).eq("id", str(comp_id)).execute()
         return {"preview_url": preview_url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
