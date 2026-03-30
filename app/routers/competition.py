@@ -1,8 +1,10 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
 from typing import List
 from uuid import UUID
 from datetime import datetime
-from app.core.supabase import supabase
+from uuid import uuid4
+import os
+from app.core.supabase import supabase, admin_supabase, SUPABASE_URL
 from app.schemas.competition import Competition, CompetitionCreate, CompetitionUpdate
 
 router = APIRouter(prefix="/competitions", tags=["competitions"])
@@ -164,4 +166,34 @@ async def update_competition(comp_id: UUID, comp_update: CompetitionUpdate):
         
     except Exception as e:
         print(f"[Backend] ERROR in update_competition: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/{comp_id}/preview")
+async def upload_competition_preview(comp_id: UUID, file: UploadFile = File(...)):
+    try:
+        bucket = os.getenv("SUPABASE_COMPETITION_PREVIEW_BUCKET", "competition-previews")
+        filename = file.filename or "preview"
+        ext = os.path.splitext(filename)[1].lower()
+        if not ext:
+            if file.content_type == "image/png":
+                ext = ".png"
+            elif file.content_type == "image/webp":
+                ext = ".webp"
+            else:
+                ext = ".jpg"
+
+        object_path = f"{comp_id}/{uuid4().hex}{ext}"
+        content = await file.read()
+
+        client = admin_supabase or supabase
+        client.storage.from_(bucket).upload(
+            object_path,
+            content,
+            file_options={"content-type": file.content_type or "application/octet-stream"},
+        )
+
+        preview_url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{object_path}"
+        supabase.table("competitions").update({"preview_url": preview_url}).eq("id", str(comp_id)).execute()
+        return {"preview_url": preview_url}
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
