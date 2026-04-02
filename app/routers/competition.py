@@ -4,20 +4,53 @@ from uuid import UUID
 from datetime import datetime
 from uuid import uuid4
 import os
+import httpx
+import anyio
 from app.core.supabase import supabase, admin_supabase, SUPABASE_URL, SUPABASE_KEY, SUPABASE_SERVICE_ROLE_KEY
 from app.schemas.competition import Competition, CompetitionCreate, CompetitionUpdate
+from app.core.cache import cache
 
 router = APIRouter(prefix="/competitions", tags=["competitions"])
 
+async def _execute(query, *, retries: int = 2):
+    for attempt in range(retries + 1):
+        try:
+            res = await anyio.to_thread.run_sync(query.execute)
+            return res
+        except Exception as e:
+            if attempt >= retries:
+                raise e
+            await anyio.sleep(0.2 * (attempt + 1))
+
 @router.get("/active")
 async def get_active_competitions():
-    res = supabase.table("competitions").select("*, categories:competition_categories(*)").gte("end_date", datetime.now().isoformat()).order("start_date", desc=False).execute()
-    return res.data
+    try:
+        cache_key = "competitions:active"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        q = supabase.table("competitions").select("*, categories:competition_categories(*)").gte("end_date", datetime.now().isoformat()).order("start_date", desc=False)
+        res = await _execute(q)
+        data = res.data
+        cache.set(cache_key, data, ttl_seconds=15.0)
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Supabase unavailable: {repr(e)}")
 
 @router.get("/", response_model=List[Competition])
 async def get_competitions():
     # Получаем соревнования с их категориями и названием локации
-    response = supabase.table("competitions").select("*, categories:competition_categories(*), locations(name)").execute()
+    try:
+        cache_key = "competitions:list"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        q = supabase.table("competitions").select("*, categories:competition_categories(*), locations(name)")
+        response = await _execute(q)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Supabase unavailable: {repr(e)}")
     
     # Добавляем location_name в результат
     data = []
@@ -26,6 +59,7 @@ async def get_competitions():
             comp["location_name"] = comp["locations"]["name"]
         data.append(comp)
         
+    cache.set(cache_key, data, ttl_seconds=15.0)
     return data
 
 @router.post("/", response_model=Competition)
@@ -81,6 +115,7 @@ async def create_competition(comp: CompetitionCreate):
             ]
             supabase.table("competition_secretaries").insert(secretaries_data).execute()
             
+        cache.invalidate_prefix("competitions:")
         return {**new_comp, "categories": final_categories}
     except Exception as e:
         print(f"[Backend] ERROR in create_competition: {str(e)}")
@@ -88,15 +123,27 @@ async def create_competition(comp: CompetitionCreate):
 
 @router.get("/{comp_id}", response_model=Competition)
 async def get_competition(comp_id: UUID):
-    response = supabase.table("competitions").select("*, categories:competition_categories(*)").eq("id", comp_id).single().execute()
+    try:
+        cache_key = f"competitions:detail:{str(comp_id)}"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        q = supabase.table("competitions").select("*, categories:competition_categories(*)").eq("id", str(comp_id)).single()
+        response = await _execute(q)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Supabase unavailable: {repr(e)}")
     if not response.data:
         raise HTTPException(status_code=404, detail="Competition not found")
-    return response.data
+    data = response.data
+    cache.set(cache_key, data, ttl_seconds=15.0)
+    return data
 
 @router.patch("/{comp_id}/", response_model=Competition)
 @router.patch("/{comp_id}", response_model=Competition)
 async def update_competition(comp_id: UUID, comp_update: CompetitionUpdate):
     try:
+        comp_id_str = str(comp_id)
         update_data = comp_update.model_dump(exclude_unset=True)
         
         # Разделяем данные: основная таблица vs связанные
@@ -111,21 +158,21 @@ async def update_competition(comp_id: UUID, comp_update: CompetitionUpdate):
                 update_data[key] = value.isoformat()
 
         if update_data:
-            res = supabase.table("competitions").update(update_data).eq("id", comp_id).execute()
+            res = supabase.table("competitions").update(update_data).eq("id", comp_id_str).execute()
             if not res.data:
                 raise HTTPException(status_code=404, detail="Competition not found")
         
         # Обновление категорий
         if categories_data is not None:
             # Получаем старые категории
-            old_cats_res = supabase.table("competition_categories").select("id").eq("competition_id", comp_id).execute()
+            old_cats_res = supabase.table("competition_categories").select("id").eq("competition_id", comp_id_str).execute()
             old_cat_ids = {str(cat["id"]) for cat in old_cats_res.data}
             
             # Вставляем новые и обновляем существующие
             if categories_data:
                 for cat in categories_data:
                     cat_dict = cat if isinstance(cat, dict) else cat.model_dump()
-                    cat_dict["competition_id"] = str(comp_id)
+                    cat_dict["competition_id"] = comp_id_str
                     if isinstance(cat_dict.get("competition_day"), datetime):
                         cat_dict["competition_day"] = cat_dict["competition_day"].isoformat()
                     if isinstance(cat_dict.get("mandate_day"), datetime):
@@ -152,16 +199,17 @@ async def update_competition(comp_id: UUID, comp_update: CompetitionUpdate):
                 
         # Обновление секретарей (полная замена)
         if secretaries_data is not None:
-            supabase.table("competition_secretaries").delete().eq("competition_id", comp_id).execute()
+            supabase.table("competition_secretaries").delete().eq("competition_id", comp_id_str).execute()
             if secretaries_data:
                 secs_to_insert = [
-                    {"competition_id": str(comp_id), "user_id": str(sec_id)}
+                    {"competition_id": comp_id_str, "user_id": str(sec_id)}
                     for sec_id in secretaries_data
                 ]
                 supabase.table("competition_secretaries").insert(secs_to_insert).execute()
                 
         # Возвращаем обновленное соревнование
-        final_res = supabase.table("competitions").select("*, categories:competition_categories(*)").eq("id", comp_id).single().execute()
+        final_res = supabase.table("competitions").select("*, categories:competition_categories(*)").eq("id", comp_id_str).single().execute()
+        cache.invalidate_prefix("competitions:")
         return final_res.data
         
     except Exception as e:
@@ -234,6 +282,7 @@ async def upload_competition_preview(comp_id: UUID, file: UploadFile = File(...)
             )
         if resp.status_code not in (200, 204):
             raise HTTPException(status_code=500, detail=f"Failed to update preview_url: {resp.status_code} {resp.text}")
+        cache.invalidate_prefix("competitions:")
         return {"preview_url": preview_url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

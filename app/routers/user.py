@@ -1,18 +1,39 @@
 from fastapi import APIRouter, HTTPException, Depends
 from typing import List, Optional
 from uuid import UUID
+import anyio
 from app.core.supabase import supabase, admin_supabase
 from app.schemas.user import Role, UserProfile, RoleAssign, AdminCreate, ProfileResponse, ProfileCreate, PassportResponse, PassportBase, AthleteResponse
 
 router = APIRouter(prefix="/users", tags=["users"])
 
+async def _execute(query, *, retries: int = 2):
+    for attempt in range(retries + 1):
+        res = await anyio.to_thread.run_sync(query.execute)
+        if res is not None:
+            return res
+        if attempt < retries:
+            await anyio.sleep(0.2 * (attempt + 1))
+    return None
+
+def _safe_data(res):
+    if res is None:
+        raise HTTPException(status_code=503, detail="Supabase request failed (no response)")
+    if hasattr(res, "error") and getattr(res, "error"):
+        raise HTTPException(status_code=503, detail=str(getattr(res, "error")))
+    if not hasattr(res, "data"):
+        raise HTTPException(status_code=503, detail="Supabase response missing data")
+    return res.data
+
 @router.get("/me/profile")
 async def get_my_profile(user_id: str):
-    res = supabase.table("profiles").select("*, location:locations(id, name, parent:locations(id, name, parent:locations(id, name)))").eq("user_id", user_id).maybe_single().execute()
-    if not res.data:
+    q = supabase.table("profiles").select("*, location:locations(id, name, parent:locations(id, name, parent:locations(id, name)))").eq("user_id", user_id).maybe_single()
+    res = await _execute(q)
+    data = _safe_data(res)
+    if not data:
         # Return empty profile instead of 404
         return {"user_id": user_id, "full_name": "", "phone": "", "city": "", "location_id": None}
-    return res.data
+    return data
 
 @router.put("/me/profile", response_model=ProfileResponse)
 async def update_my_profile(user_id: str, profile: ProfileCreate):
@@ -30,11 +51,13 @@ async def update_my_profile(user_id: str, profile: ProfileCreate):
 
 @router.get("/me/athlete")
 async def get_my_athlete(user_id: str):
-    res = supabase.table("athletes").select("*, passports(*)").eq("user_id", user_id).maybe_single().execute()
-    if not res.data:
+    q = supabase.table("athletes").select("*, passports(*)").eq("user_id", user_id).maybe_single()
+    res = await _execute(q)
+    data = _safe_data(res)
+    if not data:
         # Return a dummy response instead of 404 so admins don't crash when visiting dashboard
         return {"id": "00000000-0000-0000-0000-000000000000", "user_id": user_id, "coach_name": "", "passports": []}
-    return res.data
+    return data
 
 @router.put("/me/athlete")
 async def update_my_athlete(user_id: str, coach_name: Optional[str] = None):

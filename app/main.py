@@ -4,35 +4,57 @@ from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import httpx
 import time
+import os
+import asyncio
+from datetime import datetime
+from app.core.supabase import SUPABASE_URL, SUPABASE_KEY, SUPABASE_SERVICE_ROLE_KEY, admin_supabase
+from app.core.supabase import supabase
+from app.core.cache import cache
 
 # Import routers
-from app.routers import competition, application, brackets, user, locations, bouts, auth
+from app.routers import competition, application, brackets, user, locations, bouts, auth, live
+
+async def _warm_cache():
+    try:
+        q = supabase.table("locations").select("*").eq("type", "country").order("name")
+        res = await asyncio.to_thread(q.execute)
+        if res and hasattr(res, "data"):
+            cache.set("locations:country:", res.data, ttl_seconds=60.0)
+    except Exception:
+        pass
+
+    try:
+        q = supabase.table("competitions").select("*, categories:competition_categories(*), locations(name)")
+        res = await asyncio.to_thread(q.execute)
+        if res and hasattr(res, "data"):
+            data = []
+            for comp in res.data:
+                if comp.get("locations"):
+                    comp["location_name"] = comp["locations"]["name"]
+                data.append(comp)
+            cache.set("competitions:list", data, ttl_seconds=15.0)
+    except Exception:
+        pass
+
+    try:
+        q = supabase.table("competitions").select("*, categories:competition_categories(*)").gte("end_date", datetime.now().isoformat()).order("start_date", desc=False)
+        res = await asyncio.to_thread(q.execute)
+        if res and hasattr(res, "data"):
+            cache.set("competitions:active", res.data, ttl_seconds=15.0)
+    except Exception:
+        pass
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     print("[FastAPI] Server is starting up...")
+    warm_task = asyncio.create_task(_warm_cache())
     yield
     # Shutdown
+    warm_task.cancel()
     print("[FastAPI] Server is shutting down...")
 
 app = FastAPI(title="CompEaseBot API", lifespan=lifespan,default_response_class=JSONResponse)
-
-# Setup CORS
-origins = [
-    "http://localhost:5173",
-    "http://localhost",
-    "https://mas-wrestling.pro",
-    "https://api.mas-wrestling.pro"
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # Request Timing Middleware
 @app.middleware("http")
@@ -53,7 +75,34 @@ async def add_process_time_header(request: Request, call_next):
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
+    if os.getenv("APP_DEBUG") == "1":
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": "Internal Server Error",
+                "error": repr(exc),
+                "path": str(request.url.path),
+            },
+        )
     return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+
+# Setup CORS (must be outermost to keep CORS headers on error responses)
+origins = [
+    "http://localhost:5173",
+    "http://localhost",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1",
+    "https://mas-wrestling.pro",
+    "https://api.mas-wrestling.pro"
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Include routers
 try:
@@ -64,6 +113,7 @@ try:
     app.include_router(locations.router, prefix="/api/v1")
     app.include_router(bouts.router, prefix="/api/v1")
     app.include_router(auth.router, prefix="/api/v1")
+    app.include_router(live.router, prefix="/api/v1")
     print("ROUTERS CONNECTED SUCCESSFULLY")
 except Exception as e:
     print(f"Error connecting routers: {e}")
@@ -118,6 +168,19 @@ async def get_telegram_file(file_id: str):
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "CompEaseBot API is running"}
+
+@app.get("/api/v1/debug/env")
+async def debug_env():
+    if os.getenv("APP_DEBUG") != "1":
+        raise HTTPException(status_code=404, detail="Not Found")
+    return {
+        "supabase_url": SUPABASE_URL,
+        "has_supabase_key": bool(SUPABASE_KEY),
+        "supabase_key_len": len(SUPABASE_KEY) if SUPABASE_KEY else 0,
+        "has_service_role_key": bool(SUPABASE_SERVICE_ROLE_KEY),
+        "service_role_key_len": len(SUPABASE_SERVICE_ROLE_KEY) if SUPABASE_SERVICE_ROLE_KEY else 0,
+        "admin_client_ready": bool(admin_supabase),
+    }
 
 if __name__ == "__main__":
     import uvicorn

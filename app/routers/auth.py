@@ -7,6 +7,9 @@ import os
 import secrets
 import hmac
 import hashlib
+import time
+
+_me_cache: dict[str, tuple[float, dict]] = {}
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -100,14 +103,23 @@ async def get_me(authorization: str | None = Header(default=None)):
     if not admin_supabase:
         raise HTTPException(status_code=500, detail="SUPABASE_SERVICE_ROLE_KEY is not set")
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"{SUPABASE_URL}/auth/v1/user",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "apikey": SUPABASE_KEY,
-            },
-        )
+    cache_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    cached = _me_cache.get(cache_key)
+    if cached and cached[0] > time.time():
+        return cached[1]
+
+    try:
+        timeout = httpx.Timeout(25.0, connect=5.0)
+        async with httpx.AsyncClient(timeout=timeout, http2=False, transport=httpx.AsyncHTTPTransport(retries=2)) as client:
+            resp = await client.get(
+                f"{SUPABASE_URL}/auth/v1/user",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "apikey": SUPABASE_KEY,
+                },
+            )
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=503, detail=f"Supabase Auth unavailable: {repr(e)}")
 
     if resp.status_code != 200:
         raise HTTPException(status_code=401, detail="Invalid token")
@@ -140,12 +152,21 @@ async def get_me(authorization: str | None = Header(default=None)):
     elif is_secretary:
         primary_role = "secretary"
 
-    return {
+    result = {
         "user_id": user_id,
         "email": res.data.get("email") if res.data else user_data.get("email"),
         "role_codes": role_codes,
         "role": primary_role,
     }
+    _me_cache[cache_key] = (time.time() + 30.0, result)
+    return result
+
+@router.post("/debug/clear-cache")
+async def debug_clear_cache():
+    if os.getenv("APP_DEBUG") != "1":
+        raise HTTPException(status_code=404, detail="Not Found")
+    _me_cache.clear()
+    return {"ok": True}
 
 @router.post("/bot-signup")
 async def bot_signup(

@@ -4,9 +4,10 @@ from supabase import create_client, Client, ClientOptions
 import httpx
 from dotenv import load_dotenv
 
-# Явно указываем путь к .env файлу в папке backend
 env_path = Path(__file__).parent.parent.parent / ".env"
+root_env_path = env_path.parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
+load_dotenv(dotenv_path=root_env_path, override=False)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -21,7 +22,7 @@ if SUPABASE_SERVICE_ROLE_KEY:
     print(f"[Supabase] Service key loaded, length: {len(SUPABASE_SERVICE_ROLE_KEY)}")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError(f"SUPABASE_URL and SUPABASE_KEY must be set in .env. Checked path: {env_path}")
+    raise ValueError(f"SUPABASE_URL and SUPABASE_KEY must be set in .env. Checked path: {env_path} (and {root_env_path})")
 
 SUPABASE_URL = SUPABASE_URL.strip().rstrip("/")
 if SUPABASE_URL.endswith("/rest/v1"):
