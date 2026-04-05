@@ -12,14 +12,15 @@ load_dotenv(dotenv_path=root_env_path, override=False)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+APP_DEBUG = os.getenv("APP_DEBUG") == "1"
 
-# Отладочный вывод (без самого ключа для безопасности)
-if SUPABASE_URL:
-    print(f"[Supabase] URL loaded: {SUPABASE_URL[:20]}...")
-if SUPABASE_KEY:
-    print(f"[Supabase] Key loaded, length: {len(SUPABASE_KEY)}")
-if SUPABASE_SERVICE_ROLE_KEY:
-    print(f"[Supabase] Service key loaded, length: {len(SUPABASE_SERVICE_ROLE_KEY)}")
+if APP_DEBUG:
+    if SUPABASE_URL:
+        print(f"[Supabase] URL loaded: {SUPABASE_URL[:20]}...")
+    if SUPABASE_KEY:
+        print(f"[Supabase] Key loaded, length: {len(SUPABASE_KEY)}")
+    if SUPABASE_SERVICE_ROLE_KEY:
+        print(f"[Supabase] Service key loaded, length: {len(SUPABASE_SERVICE_ROLE_KEY)}")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError(f"SUPABASE_URL and SUPABASE_KEY must be set in .env. Checked path: {env_path} (and {root_env_path})")

@@ -1,14 +1,128 @@
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, HTTPException, Response, Header
 from pydantic import BaseModel
 from typing import List, Optional
 import random
-from uuid import UUID
-from app.core.supabase import supabase
+import hashlib
+import time
+from datetime import datetime, timezone, timedelta
+from uuid import UUID, uuid4
+import anyio
+from app.core.supabase import supabase, admin_supabase
 from app.schemas.competition import Application, ApplicationCreate, ApplicationUpdate
 
 from app.core.telegram import send_telegram_notification, get_telegram_file_url
 
 router = APIRouter(prefix="/applications", tags=["applications"])
+
+_me_cache: dict[str, tuple[float, str]] = {}
+_MSK_TZ = timezone(timedelta(hours=3))
+_APPLICATION_DEADLINE = datetime(2026, 4, 18, 0, 0, tzinfo=_MSK_TZ)
+
+def _applications_open_now() -> bool:
+    now = datetime.now(_MSK_TZ)
+    return now < _APPLICATION_DEADLINE
+
+async def _get_role_codes(user_id: str) -> list[str]:
+    if not admin_supabase:
+        return []
+    try:
+        res = admin_supabase.table("user_roles").select("roles(code)").eq("user_id", user_id).execute()
+        data = res.data or []
+        out: list[str] = []
+        for r in data:
+            role = r.get("roles")
+            if isinstance(role, list):
+                role = role[0] if role else None
+            code = role.get("code") if isinstance(role, dict) else None
+            if code:
+                out.append(str(code))
+        return out
+    except Exception:
+        return []
+
+def _is_staff(codes: list[str]) -> bool:
+    allowed = {
+        "admin",
+        "founder",
+        "country_admin",
+        "region_admin",
+        "secretary",
+        "country_secretary",
+        "region_secretary",
+    }
+    return any(c in allowed for c in codes)
+
+
+class AdminCreateAthleteApplication(BaseModel):
+    category_id: UUID
+    full_name: str
+    city: str
+    location_id: UUID
+    coach_name: str
+    birth_date: str
+    rank: str
+    photo_url: str
+    declared_weight: Optional[float] = None
+    actual_weight: Optional[float] = None
+
+
+class AdminUpdateAthleteProfile(BaseModel):
+    full_name: str
+    city: str
+    location_id: UUID
+    coach_name: str
+    birth_date: str
+    rank: str
+    photo_url: str
+
+
+class AdminApplyAthleteToCategory(BaseModel):
+    athlete_id: UUID
+    category_id: UUID
+
+async def _get_user_id_from_bearer(authorization: str | None) -> str:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+
+    cache_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    cached = _me_cache.get(cache_key)
+    if cached and cached[0] > time.time():
+        return cached[1]
+
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+
+    def _sync_get_user():
+        return admin_supabase.auth.get_user(token)
+
+    try:
+        auth_res = await anyio.to_thread.run_sync(_sync_get_user)
+    except Exception as e:
+        msg = repr(e)
+        lowered = msg.lower()
+        if "jwt" in lowered or "token" in lowered or "401" in lowered or "403" in lowered:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(status_code=503, detail=f"Supabase Auth unavailable: {msg}")
+
+    user_obj = None
+    if isinstance(auth_res, dict):
+        user_obj = auth_res.get("user") or auth_res.get("data") or auth_res.get("user_data")
+    else:
+        user_obj = getattr(auth_res, "user", None) or getattr(auth_res, "data", None)
+
+    user_id = None
+    if hasattr(user_obj, "id"):
+        user_id = getattr(user_obj, "id")
+    elif isinstance(user_obj, dict):
+        user_id = user_obj.get("id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    _me_cache[cache_key] = (time.time() + 30.0, user_id)
+    return user_id
 
 @router.get("/", response_model=List[Application])
 async def get_applications(competition_id: Optional[UUID] = None):
@@ -95,12 +209,22 @@ async def get_photo_proxy(file_id: str):
 
 @router.get("/{app_id}/")
 @router.get("/{app_id}")
-async def get_application_details(app_id: UUID):
+async def get_application_details(app_id: UUID, authorization: str | None = Header(default=None)):
     try:
+        client = supabase
+        if authorization and admin_supabase:
+            try:
+                requester_id = await _get_user_id_from_bearer(authorization)
+                codes = await _get_role_codes(requester_id)
+                if _is_staff(codes):
+                    client = admin_supabase
+            except Exception:
+                client = supabase
+
         # Получаем детальную информацию по заявке, включая паспорт
-        query = supabase.table("applications").select(
+        query = client.table("applications").select(
             "*, "
-            "athletes(coach_name, users!athletes_user_id_fkey(email, profiles(full_name, phone))), "
+            "athletes(coach_name, user_id, users!athletes_user_id_fkey(email, profiles(full_name, phone, city, location_id))), "
             "competition_categories(*)"
         ).eq("id", app_id).single().execute()
         
@@ -113,13 +237,17 @@ async def get_application_details(app_id: UUID):
         athlete_id = app_data.get("athlete_id")
         passport_data = None
         if athlete_id:
-            pass_query = supabase.table("passports").select("*").eq("athlete_id", athlete_id).maybe_single().execute()
+            pass_query = client.table("passports").select("*").eq("athlete_id", athlete_id).maybe_single().execute()
             passport_data = pass_query.data
             
             # Если есть фото, возвращаем URL на наш собственный прокси-эндпоинт
             if passport_data and passport_data.get("photo_url"):
                 file_id = passport_data["photo_url"]
-                if not file_id.startswith("http"):
+                if isinstance(file_id, str) and not (
+                    file_id.startswith("http")
+                    or file_id.startswith("documents/")
+                    or file_id.startswith("/")
+                ):
                     passport_data["photo_url"] = f"/applications/photo/{file_id}"
             
         app_data["passport"] = passport_data
@@ -135,6 +263,8 @@ async def get_application_details(app_id: UUID):
                     athlete_data = athlete_data[0] if athlete_data else {}
                 
                 app_data["coach_name"] = athlete_data.get("coach_name", "Не указан")
+                if athlete_data.get("user_id"):
+                    app_data["athlete_user_id"] = str(athlete_data.get("user_id"))
                 
                 users_data = athlete_data.get("users")
                 if users_data:
@@ -147,6 +277,8 @@ async def get_application_details(app_id: UUID):
                             profiles_data = profiles_data[0] if profiles_data else {}
                         full_name = profiles_data.get("full_name", "Unknown")
                         phone = profiles_data.get("phone", "Не указан")
+                        app_data["athlete_city"] = profiles_data.get("city")
+                        app_data["athlete_location_id"] = profiles_data.get("location_id")
                         
                         # Email получаем из users, так как в profiles его нет
                         email = users_data.get("email", "Не указан")
@@ -220,25 +352,224 @@ async def create_application(app_in: ApplicationCreate):
     return res.data[0]
 
 @router.post("/me")
-async def create_my_application(user_id: str, category_id: str):
-    athlete_res = supabase.table("athletes").select("id").eq("user_id", user_id).maybe_single().execute()
+async def create_my_application(
+    category_id: str,
+    authorization: str | None = Header(default=None),
+    user_id: str | None = None,
+):
+    if authorization:
+        user_id = await _get_user_id_from_bearer(authorization)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+
+    if not _applications_open_now():
+        raise HTTPException(status_code=403, detail="Application deadline has passed")
+
+    cat_res = admin_supabase.table("competition_categories").select("competition_id").eq("id", category_id).maybe_single().execute()
+    if not cat_res.data or not cat_res.data.get("competition_id"):
+        raise HTTPException(status_code=404, detail="Category not found")
+    competition_id = str(cat_res.data["competition_id"])
+
+    athlete_res = admin_supabase.table("athletes").select("id").eq("user_id", user_id).maybe_single().execute()
     if not athlete_res.data:
         raise HTTPException(status_code=404, detail="Athlete not found")
         
     athlete_id = athlete_res.data["id"]
     
     # Check if already applied
-    existing = supabase.table("applications").select("id").eq("athlete_id", athlete_id).eq("category_id", category_id).execute()
+    existing = admin_supabase.table("applications").select("id").eq("athlete_id", athlete_id).eq("category_id", category_id).execute()
     if existing.data:
         raise HTTPException(status_code=400, detail="Already applied to this category")
         
-    res = supabase.table("applications").insert({
+    res = admin_supabase.table("applications").insert({
+        "competition_id": competition_id,
         "athlete_id": athlete_id,
         "category_id": category_id,
         "status": "pending"
     }).execute()
     
     return res.data[0]
+
+
+@router.post("/admin-create")
+async def admin_create_athlete_and_application(
+    body: AdminCreateAthleteApplication,
+    authorization: str | None = Header(default=None),
+):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    requester_id = await _get_user_id_from_bearer(authorization)
+    codes = await _get_role_codes(requester_id)
+    if not _is_staff(codes):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    cat_id = str(body.category_id)
+    cat_res = admin_supabase.table("competition_categories").select("competition_id").eq("id", cat_id).maybe_single().execute()
+    if not cat_res.data or not cat_res.data.get("competition_id"):
+        raise HTTPException(status_code=404, detail="Category not found")
+    competition_id = str(cat_res.data["competition_id"])
+
+    user_id = str(uuid4())
+    admin_supabase.table("users").insert({"id": user_id}).execute()
+    admin_supabase.table("profiles").insert(
+        {"user_id": user_id, "full_name": body.full_name, "city": body.city, "location_id": str(body.location_id)}
+    ).execute()
+    athlete_res = admin_supabase.table("athletes").insert({"user_id": user_id, "coach_name": body.coach_name}).execute()
+    if not athlete_res.data:
+        raise HTTPException(status_code=400, detail="Failed to create athlete")
+    athlete_id = str(athlete_res.data[0]["id"])
+
+    admin_supabase.table("passports").upsert(
+        {"athlete_id": athlete_id, "birth_date": body.birth_date, "rank": body.rank, "photo_url": body.photo_url},
+        on_conflict="athlete_id",
+    ).execute()
+
+    status = "weighed" if body.actual_weight is not None else "approved"
+    app_payload = {
+        "competition_id": competition_id,
+        "athlete_id": athlete_id,
+        "category_id": cat_id,
+        "status": status,
+        "declared_weight": body.declared_weight,
+        "actual_weight": body.actual_weight,
+    }
+    app_res = admin_supabase.table("applications").insert(app_payload).execute()
+    if not app_res.data:
+        raise HTTPException(status_code=400, detail="Failed to create application")
+    return {"ok": True, "user_id": user_id, "athlete_id": athlete_id, "application": app_res.data[0]}
+
+
+@router.post("/admin-apply")
+async def admin_apply_athlete_to_category(
+    body: AdminApplyAthleteToCategory,
+    authorization: str | None = Header(default=None),
+):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    requester_id = await _get_user_id_from_bearer(authorization)
+    codes = await _get_role_codes(requester_id)
+    if not _is_staff(codes):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    cat_id = str(body.category_id)
+    cat_res = admin_supabase.table("competition_categories").select(
+        "id,competition_id,gender,age_min,age_max"
+    ).eq("id", cat_id).maybe_single().execute()
+    if not cat_res.data:
+        raise HTTPException(status_code=404, detail="Category not found")
+    category = cat_res.data
+    competition_id = str(category["competition_id"])
+
+    comp_res = admin_supabase.table("competitions").select("start_date").eq("id", competition_id).maybe_single().execute()
+    start_date_str = comp_res.data.get("start_date") if comp_res.data else None
+
+    pass_res = admin_supabase.table("passports").select("birth_date,gender,photo_url").eq("athlete_id", str(body.athlete_id)).maybe_single().execute()
+    passport = pass_res.data or {}
+    if not passport.get("birth_date") or not passport.get("gender"):
+        raise HTTPException(status_code=400, detail="Athlete birth_date and gender are required")
+
+    athlete_gender = str(passport.get("gender"))
+    if str(category.get("gender")) != athlete_gender:
+        raise HTTPException(status_code=400, detail="Athlete gender does not match category")
+
+    def _age_at(birth_date: str, at_date: str | None) -> int:
+        b = datetime.fromisoformat(str(birth_date)).date()
+        if at_date:
+            s = str(at_date).replace("Z", "+00:00")
+            at = datetime.fromisoformat(s).date()
+        else:
+            at = datetime.now(_MSK_TZ).date()
+        age = at.year - b.year
+        if (at.month, at.day) < (b.month, b.day):
+            age -= 1
+        return age
+
+    age = _age_at(str(passport.get("birth_date")), start_date_str)
+    if age < int(category.get("age_min") or 0) or age > int(category.get("age_max") or 200):
+        raise HTTPException(status_code=400, detail="Athlete age does not match category")
+
+    existing_app = (
+        admin_supabase.table("applications")
+        .select("id,status,category_id")
+        .eq("athlete_id", str(body.athlete_id))
+        .eq("competition_id", competition_id)
+        .maybe_single()
+        .execute()
+    )
+    if existing_app.data:
+        existing_id = str(existing_app.data.get("id"))
+        existing_status = str(existing_app.data.get("status") or "")
+        if existing_status != "rejected":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Athlete already has an application for this competition (status: {existing_status})",
+            )
+        del_res = admin_supabase.table("applications").delete().eq("id", existing_id).execute()
+        if del_res.data is None:
+            raise HTTPException(status_code=400, detail="Failed to delete rejected application")
+
+    try:
+        app_res = admin_supabase.table("applications").insert(
+            {
+                "competition_id": competition_id,
+                "athlete_id": str(body.athlete_id),
+                "category_id": cat_id,
+                "status": "approved",
+            }
+        ).execute()
+    except Exception as e:
+        code = getattr(e, "code", None)
+        msg = str(e)
+        if code == "23505" or "23505" in msg or "duplicate key value" in msg:
+            raise HTTPException(status_code=400, detail="Athlete already has an application for this competition")
+        raise
+    if not app_res.data:
+        raise HTTPException(status_code=400, detail="Failed to create application")
+    return {
+        "ok": True,
+        "application": app_res.data[0],
+        "replaced": bool(existing_app.data),
+    }
+
+@router.put("/{app_id}/athlete-profile")
+async def admin_update_athlete_profile(
+    app_id: UUID,
+    body: AdminUpdateAthleteProfile,
+    authorization: str | None = Header(default=None),
+):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    requester_id = await _get_user_id_from_bearer(authorization)
+    codes = await _get_role_codes(requester_id)
+    if not _is_staff(codes):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    app_res = admin_supabase.table("applications").select("athlete_id").eq("id", str(app_id)).maybe_single().execute()
+    if not app_res.data or not app_res.data.get("athlete_id"):
+        raise HTTPException(status_code=404, detail="Application not found")
+    athlete_id = str(app_res.data["athlete_id"])
+
+    ath_res = admin_supabase.table("athletes").select("user_id").eq("id", athlete_id).maybe_single().execute()
+    if not ath_res.data or not ath_res.data.get("user_id"):
+        raise HTTPException(status_code=404, detail="Athlete not found")
+    user_id = str(ath_res.data["user_id"])
+
+    admin_supabase.table("profiles").upsert(
+        {
+            "user_id": user_id,
+            "full_name": body.full_name,
+            "city": body.city,
+            "location_id": str(body.location_id),
+        },
+        on_conflict="user_id",
+    ).execute()
+    admin_supabase.table("athletes").update({"coach_name": body.coach_name}).eq("id", athlete_id).execute()
+    admin_supabase.table("passports").upsert(
+        {"athlete_id": athlete_id, "birth_date": body.birth_date, "rank": body.rank, "photo_url": body.photo_url},
+        on_conflict="athlete_id",
+    ).execute()
+
+    return {"ok": True}
 
 @router.patch("/{app_id}/", response_model=Application)
 @router.patch("/{app_id}", response_model=Application)
@@ -272,34 +603,6 @@ async def update_application_status(app_id: UUID, app_update: ApplicationUpdate)
         if isinstance(value, UUID):
             update_data[key] = str(value)
             
-    # Логика автоматической жеребьевки:
-    # Если статус меняется на 'weighed' и раньше он не был 'weighed'
-    if update_data.get("status") == "weighed" and old_app.get("status") != "weighed":
-        comp_id = old_app.get("competition_id")
-        cat_id = update_data.get("category_id") or old_app.get("category_id")
-        
-        # Получаем все занятые номера жеребьевки для этой категории в этом соревновании
-        try:
-            used_draws_res = supabase.table("applications") \
-                .select("draw_number") \
-                .eq("competition_id", comp_id) \
-                .eq("category_id", cat_id) \
-                .not_.is_("draw_number", "null") \
-                .execute()
-                
-            used_draws = {app["draw_number"] for app in used_draws_res.data}
-            
-            # Генерируем случайное число от 1 до 10000, которое еще не занято
-            next_draw = random.randint(1, 10000)
-            attempts = 0
-            while next_draw in used_draws and attempts < 10000:
-                next_draw = random.randint(1, 10000)
-                attempts += 1
-                
-            update_data["draw_number"] = next_draw
-        except Exception as e:
-            print(f"Error generating draw_number: {e}")
-
     res = supabase.table("applications") \
         .update(update_data) \
         .eq("id", app_id) \

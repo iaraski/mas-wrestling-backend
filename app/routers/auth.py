@@ -15,6 +15,7 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 TG_CONFIRM_SECRET = os.getenv("TG_CONFIRM_SECRET", "")
 PUBLIC_WEB_URL = os.getenv("PUBLIC_WEB_URL", "https://mas-wrestling.pro")
+APP_DEBUG = os.getenv("APP_DEBUG") == "1"
 
 def _require_service_role():
     if not admin_supabase or not SUPABASE_SERVICE_ROLE_KEY:
@@ -141,7 +142,8 @@ async def get_me(authorization: str | None = Header(default=None)):
             if ur and ur.get("roles") and ur.get("roles", {}).get("code")
         ]
         
-    print(f"User {user_id} roles: {role_codes}")
+    if APP_DEBUG:
+        print(f"User {user_id} roles: {role_codes}")
 
     is_admin = any(c in ["admin", "founder", "country_admin", "region_admin", "country_secretary", "region_secretary"] for c in role_codes)
     is_secretary = any(c in ["secretary", "country_secretary", "region_secretary"] for c in role_codes)
@@ -203,7 +205,8 @@ async def bot_signup(
         )
         if resend_resp.status_code not in (200, 201, 204):
             # Not fatal for flow, but surface for visibility
-            print("[auth/bot-signup] resend failed", resend_resp.status_code, resend_resp.text)
+            if APP_DEBUG:
+                print("[auth/bot-signup] resend failed", resend_resp.status_code, resend_resp.text)
 
     # Store email on our side too
     admin_supabase.table("users").update({"email": email}).eq("id", db_user_id).execute()
@@ -259,7 +262,8 @@ async def bot_init_email(
             },
         )
         if resend_resp.status_code not in (200, 201, 204):
-            print("[auth/bot-init-email] resend failed", resend_resp.status_code, resend_resp.text)
+            if APP_DEBUG:
+                print("[auth/bot-init-email] resend failed", resend_resp.status_code, resend_resp.text)
 
     # Сохраняем email у нас
     admin_supabase.table("users").update({"email": email}).eq("id", db_user_id).execute()
@@ -402,7 +406,8 @@ async def bot_update_email(
             json={"type": "signup", "email": new_email},
         )
     if resend_resp.status_code not in (200, 201, 204):
-        print("[auth/bot-update-email] resend failed", resend_resp.status_code, resend_resp.text)
+        if APP_DEBUG:
+            print("[auth/bot-update-email] resend failed", resend_resp.status_code, resend_resp.text)
 
     admin_supabase.table("users").update({"email": new_email}).eq("id", db_user_id).execute()
     return {"ok": True}

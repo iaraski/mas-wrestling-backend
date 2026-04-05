@@ -11,6 +11,8 @@ from app.core.supabase import SUPABASE_URL, SUPABASE_KEY, SUPABASE_SERVICE_ROLE_
 from app.core.supabase import supabase
 from app.core.cache import cache
 
+APP_DEBUG = os.getenv("APP_DEBUG") == "1"
+
 # Import routers
 from app.routers import competition, application, brackets, user, locations, bouts, auth, live
 
@@ -46,45 +48,15 @@ async def _warm_cache():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    print("[FastAPI] Server is starting up...")
+    if APP_DEBUG:
+        print("[FastAPI] Server is starting up...")
     warm_task = asyncio.create_task(_warm_cache())
     yield
-    # Shutdown
     warm_task.cancel()
-    print("[FastAPI] Server is shutting down...")
+    if APP_DEBUG:
+        print("[FastAPI] Server is shutting down...")
 
 app = FastAPI(title="CompEaseBot API", lifespan=lifespan,default_response_class=JSONResponse)
-
-# Request Timing Middleware
-@app.middleware("http")
-async def add_process_time_header(request: Request, call_next):
-    start_time = time.time()
-    print(f"INCOMING: {request.method} {request.url.path}")
-    
-    try:
-        response = await call_next(request)
-        process_time = time.time() - start_time
-        response.headers["X-Process-Time"] = str(process_time)
-        print(f"STATUS: {response.status_code} ({process_time:.4f}s)")
-        return response
-    except Exception as e:
-        process_time = time.time() - start_time
-        print(f"ERROR: {repr(e)} ({process_time:.4f}s)")
-        raise e
-
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(request: Request, exc: Exception):
-    if os.getenv("APP_DEBUG") == "1":
-        return JSONResponse(
-            status_code=500,
-            content={
-                "detail": "Internal Server Error",
-                "error": repr(exc),
-                "path": str(request.url.path),
-            },
-        )
-    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
 # Setup CORS (must be outermost to keep CORS headers on error responses)
 origins = [
@@ -104,6 +76,39 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Request Timing Middleware
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    start_time = time.time()
+    if APP_DEBUG:
+        print(f"INCOMING: {request.method} {request.url.path}")
+    
+    try:
+        response = await call_next(request)
+        process_time = time.time() - start_time
+        response.headers["X-Process-Time"] = str(process_time)
+        if APP_DEBUG:
+            print(f"STATUS: {response.status_code} ({process_time:.4f}s)")
+        return response
+    except Exception as e:
+        process_time = time.time() - start_time
+        if APP_DEBUG:
+            print(f"ERROR: {repr(e)} ({process_time:.4f}s)")
+        raise e
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    if os.getenv("APP_DEBUG") == "1":
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": "Internal Server Error",
+                "error": repr(exc),
+                "path": str(request.url.path),
+            },
+        )
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+
 # Include routers
 try:
     app.include_router(competition.router, prefix="/api/v1")
@@ -114,7 +119,8 @@ try:
     app.include_router(bouts.router, prefix="/api/v1")
     app.include_router(auth.router, prefix="/api/v1")
     app.include_router(live.router, prefix="/api/v1")
-    print("ROUTERS CONNECTED SUCCESSFULLY")
+    if APP_DEBUG:
+        print("ROUTERS CONNECTED SUCCESSFULLY")
 except Exception as e:
     print(f"Error connecting routers: {e}")
 

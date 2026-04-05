@@ -4,12 +4,14 @@ from typing import Optional, Any
 
 # This will be evaluated when the module is imported
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+APP_DEBUG = os.getenv("APP_DEBUG") == "1"
 
 if not BOT_TOKEN:
     print("[Telegram Core] WARNING: BOT_TOKEN is not set in environment variables!")
 else:
-    masked = f"{BOT_TOKEN[:5]}...{BOT_TOKEN[-5:]}" if len(BOT_TOKEN) > 10 else "***"
-    print(f"[Telegram Core] BOT_TOKEN loaded: {masked}")
+    if APP_DEBUG:
+        masked = f"{BOT_TOKEN[:5]}...{BOT_TOKEN[-5:]}" if len(BOT_TOKEN) > 10 else "***"
+        print(f"[Telegram Core] BOT_TOKEN loaded: {masked}")
 
 async def get_telegram_file_url(file_id: str) -> Optional[str]:
     if not BOT_TOKEN:
@@ -53,6 +55,7 @@ async def send_telegram_notification(chat_id: int, text: str, reply_markup: Any 
             if response.status_code != 200:
                 print(f"[Telegram Notification] Error: {response.status_code} - {response.text}")
             else:
-                print(f"[Telegram Notification] Sent to {chat_id}: {text[:50]}...")
+                if APP_DEBUG:
+                    print(f"[Telegram Notification] Sent to {chat_id}: {text[:50]}...")
         except Exception as e:
             print(f"[Telegram Notification] Critical Error: {e}")

@@ -1,20 +1,122 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Header
+from pydantic import BaseModel
 from typing import List, Optional
 from uuid import UUID
 import anyio
+import hashlib
+import time
+from datetime import date
 from app.core.supabase import supabase, admin_supabase
 from app.schemas.user import Role, UserProfile, RoleAssign, AdminCreate, ProfileResponse, ProfileCreate, PassportResponse, PassportBase, AthleteResponse
 
 router = APIRouter(prefix="/users", tags=["users"])
 
+_me_cache: dict[str, tuple[float, str]] = {}
+
+
+class AthleteDetailsUpdate(BaseModel):
+    birth_date: Optional[date] = None
+    rank: Optional[str] = None
+    photo_url: Optional[str] = None
+    gender: Optional[str] = None
+
+
+class AdminAthleteUpdate(BaseModel):
+    full_name: Optional[str] = None
+    phone: Optional[str] = None
+    city: Optional[str] = None
+    location_id: Optional[UUID] = None
+    coach_name: Optional[str] = None
+    birth_date: Optional[date] = None
+    gender: Optional[str] = None
+    rank: Optional[str] = None
+    photo_url: Optional[str] = None
+
+
+class EditableUpdate(BaseModel):
+    editable: bool
+
+
+def _is_staff_role(codes: list[str]) -> bool:
+    allowed = {
+        "admin",
+        "founder",
+        "country_admin",
+        "region_admin",
+        "secretary",
+        "country_secretary",
+        "region_secretary",
+    }
+    return any(c in allowed for c in codes)
+
+
+async def _get_my_role_codes(user_id: str) -> list[str]:
+    if not admin_supabase:
+        return []
+    try:
+        res = await _execute(
+            admin_supabase.table("user_roles")
+            .select("roles(code)")
+            .eq("user_id", user_id)
+        )
+        data = _safe_data(res) or []
+        out: list[str] = []
+        for r in data:
+            role = r.get("roles")
+            if isinstance(role, list):
+                role = role[0] if role else None
+            code = role.get("code") if isinstance(role, dict) else None
+            if code:
+                out.append(str(code))
+        return out
+    except Exception:
+        return []
+
+
+async def _is_profile_locked(user_id: str) -> bool:
+    if not admin_supabase:
+        return False
+    try:
+        res = await _execute(
+            admin_supabase.table("registrations")
+            .select("stage")
+            .eq("user_id", user_id)
+            .maybe_single()
+        )
+        data = _safe_data(res)
+        return bool(data and str(data.get("stage") or "") == "complete")
+    except Exception:
+        return False
+
+
+async def _require_can_edit_self(user_id: str, authorization: str | None):
+    role_codes = await _get_my_role_codes(user_id)
+    if _is_staff_role(role_codes):
+        return
+    if await _is_profile_locked(user_id):
+        raise HTTPException(status_code=403, detail="Profile is locked")
+
+
+async def _require_staff(authorization: str | None) -> str:
+    user_id = await _get_user_id_from_bearer(authorization)
+    role_codes = await _get_my_role_codes(user_id)
+    if not _is_staff_role(role_codes):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return user_id
+
 async def _execute(query, *, retries: int = 2):
     for attempt in range(retries + 1):
-        res = await anyio.to_thread.run_sync(query.execute)
-        if res is not None:
+        try:
+            res = await anyio.to_thread.run_sync(query.execute)
+            if res is None:
+                raise RuntimeError("Supabase returned no response")
+            if hasattr(res, "error") and getattr(res, "error"):
+                raise RuntimeError(str(getattr(res, "error")))
             return res
-        if attempt < retries:
-            await anyio.sleep(0.2 * (attempt + 1))
-    return None
+        except Exception:
+            if attempt >= retries:
+                raise
+            await anyio.sleep(0.25 * (attempt + 1))
 
 def _safe_data(res):
     if res is None:
@@ -25,90 +127,265 @@ def _safe_data(res):
         raise HTTPException(status_code=503, detail="Supabase response missing data")
     return res.data
 
+async def _get_user_id_from_bearer(authorization: str | None) -> str:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+
+    cache_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    cached = _me_cache.get(cache_key)
+    if cached and cached[0] > time.time():
+        return cached[1]
+
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+
+    def _sync_get_user():
+        return admin_supabase.auth.get_user(token)
+
+    try:
+        auth_res = await anyio.to_thread.run_sync(_sync_get_user)
+    except Exception as e:
+        msg = repr(e)
+        lowered = msg.lower()
+        if "jwt" in lowered or "token" in lowered or "401" in lowered or "403" in lowered:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(status_code=503, detail=f"Supabase Auth unavailable: {msg}")
+
+    user_obj = None
+    if isinstance(auth_res, dict):
+        user_obj = auth_res.get("user") or auth_res.get("data") or auth_res.get("user_data")
+    else:
+        user_obj = getattr(auth_res, "user", None) or getattr(auth_res, "data", None)
+
+    user_id = None
+    if hasattr(user_obj, "id"):
+        user_id = getattr(user_obj, "id")
+    elif isinstance(user_obj, dict):
+        user_id = user_obj.get("id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    _me_cache[cache_key] = (time.time() + 30.0, user_id)
+    return user_id
+
 @router.get("/me/profile")
-async def get_my_profile(user_id: str):
-    q = supabase.table("profiles").select("*, location:locations(id, name, parent:locations(id, name, parent:locations(id, name)))").eq("user_id", user_id).maybe_single()
+async def get_my_profile(authorization: str | None = Header(default=None)):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    user_id = await _get_user_id_from_bearer(authorization)
+    q = (
+        admin_supabase.table("profiles")
+        .select("id,user_id,full_name,phone,city,location_id,created_at")
+        .eq("user_id", user_id)
+        .maybe_single()
+    )
     res = await _execute(q)
     data = _safe_data(res)
     if not data:
-        # Return empty profile instead of 404
         return {"user_id": user_id, "full_name": "", "phone": "", "city": "", "location_id": None}
     return data
 
 @router.put("/me/profile", response_model=ProfileResponse)
-async def update_my_profile(user_id: str, profile: ProfileCreate):
-    res = supabase.table("profiles").upsert(
-        {
-            "user_id": user_id,
-            "full_name": profile.full_name,
-            "phone": profile.phone,
-            "location_id": profile.location_id,
-            "city": profile.city,
-        },
-        on_conflict="user_id"
-    ).execute()
-    return res.data[0]
-
-@router.get("/me/athlete")
-async def get_my_athlete(user_id: str):
-    q = supabase.table("athletes").select("*, passports(*)").eq("user_id", user_id).maybe_single()
+async def update_my_profile(profile: ProfileCreate, authorization: str | None = Header(default=None)):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    user_id = await _get_user_id_from_bearer(authorization)
+    await _require_can_edit_self(user_id, authorization)
+    payload: dict[str, object] = {"user_id": user_id}
+    if profile.full_name and profile.full_name.strip():
+        payload["full_name"] = profile.full_name.strip()
+    if profile.phone and profile.phone.strip():
+        payload["phone"] = profile.phone.strip()
+    if profile.city and profile.city.strip():
+        payload["city"] = profile.city.strip()
+    if profile.location_id is not None:
+        payload["location_id"] = str(profile.location_id)
+    q = admin_supabase.table("profiles").upsert(
+        payload,
+        on_conflict="user_id",
+    )
     res = await _execute(q)
     data = _safe_data(res)
-    if not data:
-        # Return a dummy response instead of 404 so admins don't crash when visiting dashboard
-        return {"id": "00000000-0000-0000-0000-000000000000", "user_id": user_id, "coach_name": "", "passports": []}
-    return data
+    return (data[0] if isinstance(data, list) and data else data) or {"user_id": user_id}
+
+@router.get("/me/athlete")
+async def get_my_athlete(authorization: str | None = Header(default=None)):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    user_id = await _get_user_id_from_bearer(authorization)
+    try:
+        q = admin_supabase.table("athletes").select("*, passports(*)").eq("user_id", user_id).maybe_single()
+        res = await _execute(q)
+        data = _safe_data(res)
+        if not data:
+            return {
+                "id": "00000000-0000-0000-0000-000000000000",
+                "user_id": user_id,
+                "coach_name": "",
+                "passports": [],
+            }
+        return data
+    except Exception:
+        return {
+            "id": "00000000-0000-0000-0000-000000000000",
+            "user_id": user_id,
+            "coach_name": "",
+            "passports": [],
+        }
 
 @router.put("/me/athlete")
-async def update_my_athlete(user_id: str, coach_name: Optional[str] = None):
-    res = supabase.table("athletes").upsert(
+async def update_my_athlete(coach_name: Optional[str] = None, authorization: str | None = Header(default=None)):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    user_id = await _get_user_id_from_bearer(authorization)
+    await _require_can_edit_self(user_id, authorization)
+    q = admin_supabase.table("athletes").upsert(
         {
             "user_id": user_id,
             "coach_name": coach_name,
         },
-        on_conflict="user_id"
-    ).execute()
-    return res.data[0]
+        on_conflict="user_id",
+    )
+    res = await _execute(q)
+    data = _safe_data(res)
+    return (data[0] if isinstance(data, list) and data else data) or {"user_id": user_id}
 
-@router.put("/me/passport", response_model=PassportResponse)
-async def update_my_passport(user_id: str, passport: PassportBase):
-    # Get athlete ID first
-    athlete_res = supabase.table("athletes").select("id").eq("user_id", user_id).maybe_single().execute()
-    if not athlete_res.data:
+@router.get("/me/details")
+async def get_my_details(authorization: str | None = Header(default=None)):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    user_id = await _get_user_id_from_bearer(authorization)
+    try:
+        athlete_res = await _execute(
+            admin_supabase.table("athletes").select("id").eq("user_id", user_id).maybe_single()
+        )
+        athlete_data = _safe_data(athlete_res)
+        if not athlete_data:
+            return {"birth_date": None, "rank": None, "photo_url": None, "gender": None}
+        athlete_id = str(athlete_data["id"])
+        p_res = await _execute(
+            admin_supabase.table("passports")
+            .select("birth_date,rank,photo_url,gender")
+            .eq("athlete_id", athlete_id)
+            .maybe_single()
+        )
+        p = _safe_data(p_res) or {}
+        return {
+            "birth_date": p.get("birth_date"),
+            "rank": p.get("rank"),
+            "photo_url": p.get("photo_url"),
+            "gender": p.get("gender"),
+        }
+    except Exception:
+        return {"birth_date": None, "rank": None, "photo_url": None, "gender": None}
+
+
+@router.put("/me/details")
+async def update_my_details(body: AthleteDetailsUpdate, authorization: str | None = Header(default=None)):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    user_id = await _get_user_id_from_bearer(authorization)
+    await _require_can_edit_self(user_id, authorization)
+    athlete_q = admin_supabase.table("athletes").select("id").eq("user_id", user_id).maybe_single()
+    athlete_res = await _execute(athlete_q)
+    athlete_data = _safe_data(athlete_res)
+    if not athlete_data:
         raise HTTPException(status_code=404, detail="Athlete profile must be created first")
-    
-    athlete_id = athlete_res.data["id"]
-    
-    # Check if verified
-    existing_passport = supabase.table("passports").select("is_verified").eq("athlete_id", athlete_id).maybe_single().execute()
-    if existing_passport.data and existing_passport.data.get("is_verified"):
-        raise HTTPException(status_code=403, detail="Passport is verified and cannot be edited")
+    athlete_id = str(athlete_data["id"])
+    payload: dict[str, object] = {"athlete_id": athlete_id}
+    if body.birth_date is not None:
+        payload["birth_date"] = str(body.birth_date)
+    if body.rank is not None:
+        payload["rank"] = body.rank
+    if body.photo_url is not None:
+        payload["photo_url"] = body.photo_url
+    if body.gender is not None:
+        payload["gender"] = body.gender
+    await _execute(
+        admin_supabase.table("passports").upsert(
+            payload,
+            on_conflict="athlete_id",
+        )
+    )
+    return {"ok": True}
 
-    res = supabase.table("passports").upsert(
-        {
-            "athlete_id": athlete_id,
-            "series": passport.series,
-            "number": passport.number,
-            "issued_by": passport.issued_by,
-            "issue_date": str(passport.issue_date),
-            "birth_date": str(passport.birth_date),
-            "gender": passport.gender,
-            "rank": passport.rank,
-            "photo_url": passport.photo_url,
-            "passport_scan_url": passport.passport_scan_url,
-        },
-        on_conflict="athlete_id"
-    ).execute()
-    return res.data[0]
+
+@router.post("/me/complete")
+async def complete_my_profile(authorization: str | None = Header(default=None)):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    user_id = await _get_user_id_from_bearer(authorization)
+    role_codes = await _get_my_role_codes(user_id)
+    if _is_staff_role(role_codes):
+        raise HTTPException(status_code=400, detail="Staff accounts cannot be completed here")
+
+    prof_res = await _execute(admin_supabase.table("profiles").select("full_name,city,location_id").eq("user_id", user_id).maybe_single())
+    prof = _safe_data(prof_res) or {}
+    ath_res = await _execute(admin_supabase.table("athletes").select("id,coach_name").eq("user_id", user_id).maybe_single())
+    ath = _safe_data(ath_res) or {}
+    athlete_id = str(ath.get("id") or "")
+    p_res = await _execute(
+        admin_supabase.table("passports")
+        .select("birth_date,rank,photo_url,gender")
+        .eq("athlete_id", athlete_id)
+        .maybe_single()
+    )
+    p = _safe_data(p_res) or {}
+
+    if not prof.get("full_name") or not prof.get("city") or not prof.get("location_id"):
+        raise HTTPException(status_code=400, detail="Fill full_name, city and region")
+    if not ath.get("coach_name"):
+        raise HTTPException(status_code=400, detail="Fill coach name")
+    if not p.get("birth_date") or not p.get("rank") or not p.get("photo_url") or not p.get("gender"):
+        raise HTTPException(status_code=400, detail="Fill birth_date, gender, rank and upload photo")
+
+    await _execute(
+        admin_supabase.table("registrations").upsert(
+            {"user_id": user_id, "stage": "complete", "consent_accepted": True},
+            on_conflict="user_id",
+        )
+    )
+    return {"ok": True, "locked": True}
+
+
+@router.get("/me/registration")
+async def get_my_registration(authorization: str | None = Header(default=None)):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    user_id = await _get_user_id_from_bearer(authorization)
+    try:
+        res = await _execute(
+            admin_supabase.table("registrations")
+            .select("stage,consent_accepted,updated_at")
+            .eq("user_id", user_id)
+            .maybe_single()
+        )
+        data = _safe_data(res)
+        stage = (data or {}).get("stage") if isinstance(data, dict) else None
+        if not stage:
+            stage = "start"
+        return {"user_id": user_id, "stage": stage, "locked": bool(stage == "complete")}
+    except Exception:
+        return {"user_id": user_id, "stage": "start", "locked": False}
 
 @router.get("/me/applications")
-async def get_my_applications(user_id: str):
-    athlete_res = supabase.table("athletes").select("id").eq("user_id", user_id).maybe_single().execute()
-    if not athlete_res.data:
+async def get_my_applications(authorization: str | None = Header(default=None)):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    user_id = await _get_user_id_from_bearer(authorization)
+    try:
+        athlete_res = await _execute(admin_supabase.table("athletes").select("id").eq("user_id", user_id).maybe_single())
+        athlete_data = _safe_data(athlete_res)
+        if not athlete_data:
+            return []
+    except Exception:
         return []
     
-    athlete_id = athlete_res.data["id"]
-    res = supabase.table("applications").select(
+    athlete_id = athlete_data["id"]
+    res = admin_supabase.table("applications").select(
         "id, status, draw_number, created_at, category_id, competitions(id, name, start_date), competition_categories(gender, age_min, age_max, weight_min, weight_max)"
     ).eq("athlete_id", athlete_id).order("created_at", desc=True).execute()
     
@@ -214,6 +491,215 @@ async def create_admin_user(payload: AdminCreate):
         location_id=loc_id,
         location_name=loc_name,
     )
+
+
+@router.get("/athletes")
+async def list_athletes(
+    authorization: str | None = Header(default=None),
+    query: str | None = None,
+    limit: int = 200,
+):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    await _require_staff(authorization)
+
+    limit = max(1, min(int(limit), 500))
+
+    user_ids: list[str] | None = None
+    if query:
+        q = await _execute(
+            admin_supabase.table("profiles")
+            .select("user_id")
+            .ilike("full_name", f"%{query}%")
+            .limit(500)
+        )
+        data = _safe_data(q) or []
+        user_ids = [str(p.get("user_id")) for p in data if p.get("user_id")]
+        if not user_ids:
+            return []
+
+    athletes_q = (
+        admin_supabase.table("athletes")
+        .select(
+            "id,user_id,coach_name,"
+            "users:users!athletes_user_id_fkey(email,profiles(full_name,phone,city,location_id)),"
+            "passports(birth_date,gender,rank,photo_url)"
+        )
+        .limit(limit)
+    )
+    if user_ids is not None:
+        athletes_q = athletes_q.in_("user_id", user_ids)
+
+    res = await _execute(athletes_q)
+    rows = _safe_data(res) or []
+    out: list[dict] = []
+    for r in rows:
+        users_data = r.get("users")
+        if isinstance(users_data, list):
+            users_data = users_data[0] if users_data else None
+        profiles_data = users_data.get("profiles") if isinstance(users_data, dict) else None
+        if isinstance(profiles_data, list):
+            profiles_data = profiles_data[0] if profiles_data else None
+        passports_data = r.get("passports")
+        if isinstance(passports_data, list):
+            passports_data = passports_data[0] if passports_data else None
+
+        out.append(
+            {
+                "athlete_id": r.get("id"),
+                "user_id": r.get("user_id"),
+                "full_name": (profiles_data or {}).get("full_name"),
+                "phone": (profiles_data or {}).get("phone"),
+                "city": (profiles_data or {}).get("city"),
+                "location_id": (profiles_data or {}).get("location_id"),
+                "email": (users_data or {}).get("email") if isinstance(users_data, dict) else None,
+                "coach_name": r.get("coach_name"),
+                "birth_date": (passports_data or {}).get("birth_date"),
+                "gender": (passports_data or {}).get("gender"),
+                "rank": (passports_data or {}).get("rank"),
+                "photo_url": (passports_data or {}).get("photo_url"),
+            }
+        )
+    return out
+
+
+@router.get("/athletes/{athlete_id}")
+async def get_athlete_details(
+    athlete_id: UUID,
+    authorization: str | None = Header(default=None),
+):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    await _require_staff(authorization)
+
+    ath_res = await _execute(
+        admin_supabase.table("athletes")
+        .select("id,user_id,coach_name")
+        .eq("id", str(athlete_id))
+        .maybe_single()
+    )
+    athlete = _safe_data(ath_res)
+    if not athlete:
+        raise HTTPException(status_code=404, detail="Athlete not found")
+
+    user_id = str(athlete.get("user_id"))
+    prof_res = await _execute(
+        admin_supabase.table("profiles")
+        .select("user_id,full_name,phone,city,location_id")
+        .eq("user_id", user_id)
+        .maybe_single()
+    )
+    prof = _safe_data(prof_res) or {}
+
+    p_res = await _execute(
+        admin_supabase.table("passports")
+        .select("birth_date,gender,rank,photo_url")
+        .eq("athlete_id", str(athlete_id))
+        .maybe_single()
+    )
+    p = _safe_data(p_res) or {}
+
+    reg_res = await _execute(
+        admin_supabase.table("registrations")
+        .select("stage")
+        .eq("user_id", user_id)
+        .maybe_single()
+    )
+    reg = _safe_data(reg_res) or {}
+    stage = str(reg.get("stage") or "start")
+
+    return {
+        "athlete_id": str(athlete_id),
+        "user_id": user_id,
+        "full_name": prof.get("full_name"),
+        "phone": prof.get("phone"),
+        "city": prof.get("city"),
+        "location_id": prof.get("location_id"),
+        "coach_name": athlete.get("coach_name"),
+        "birth_date": p.get("birth_date"),
+        "gender": p.get("gender"),
+        "rank": p.get("rank"),
+        "photo_url": p.get("photo_url"),
+        "stage": stage,
+        "locked": bool(stage == "complete"),
+    }
+
+
+@router.put("/athletes/{athlete_id}")
+async def update_athlete_details(
+    athlete_id: UUID,
+    body: AdminAthleteUpdate,
+    authorization: str | None = Header(default=None),
+):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    await _require_staff(authorization)
+
+    ath_res = await _execute(
+        admin_supabase.table("athletes")
+        .select("id,user_id")
+        .eq("id", str(athlete_id))
+        .maybe_single()
+    )
+    athlete = _safe_data(ath_res)
+    if not athlete:
+        raise HTTPException(status_code=404, detail="Athlete not found")
+    user_id = str(athlete.get("user_id"))
+
+    prof_payload: dict[str, object] = {"user_id": user_id}
+    if body.full_name is not None:
+        prof_payload["full_name"] = body.full_name
+    if body.phone is not None:
+        prof_payload["phone"] = body.phone
+    if body.city is not None:
+        prof_payload["city"] = body.city
+    if body.location_id is not None:
+        prof_payload["location_id"] = str(body.location_id)
+    await _execute(admin_supabase.table("profiles").upsert(prof_payload, on_conflict="user_id"))
+
+    if body.coach_name is not None:
+        await _execute(admin_supabase.table("athletes").update({"coach_name": body.coach_name}).eq("id", str(athlete_id)))
+
+    pass_payload: dict[str, object] = {"athlete_id": str(athlete_id)}
+    if body.birth_date is not None:
+        pass_payload["birth_date"] = str(body.birth_date)
+    if body.gender is not None:
+        pass_payload["gender"] = body.gender
+    if body.rank is not None:
+        pass_payload["rank"] = body.rank
+    if body.photo_url is not None:
+        pass_payload["photo_url"] = body.photo_url
+    await _execute(admin_supabase.table("passports").upsert(pass_payload, on_conflict="athlete_id"))
+
+    return {"ok": True}
+
+
+@router.post("/athletes/{athlete_id}/editable")
+async def set_athlete_editable(
+    athlete_id: UUID,
+    body: EditableUpdate,
+    authorization: str | None = Header(default=None),
+):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    await _require_staff(authorization)
+
+    ath_res = await _execute(
+        admin_supabase.table("athletes")
+        .select("user_id")
+        .eq("id", str(athlete_id))
+        .maybe_single()
+    )
+    athlete = _safe_data(ath_res)
+    if not athlete or not athlete.get("user_id"):
+        raise HTTPException(status_code=404, detail="Athlete not found")
+
+    user_id = str(athlete.get("user_id"))
+    stage = "start" if body.editable else "complete"
+    await _execute(
+        admin_supabase.table("registrations").upsert({"user_id": user_id, "stage": stage}, on_conflict="user_id")
+    )
+    return {"ok": True, "stage": stage, "locked": bool(stage == "complete")}
 
 @router.get("/roles", response_model=List[Role])
 async def get_roles():
