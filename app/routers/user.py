@@ -109,13 +109,15 @@ async def _execute(query, *, retries: int = 2):
         try:
             res = await anyio.to_thread.run_sync(query.execute)
             if res is None:
-                raise RuntimeError("Supabase returned no response")
+                raise HTTPException(status_code=503, detail="Supabase temporarily unavailable")
             if hasattr(res, "error") and getattr(res, "error"):
-                raise RuntimeError(str(getattr(res, "error")))
+                raise HTTPException(status_code=503, detail=str(getattr(res, "error")))
             return res
-        except Exception:
+        except HTTPException:
+            raise
+        except Exception as e:
             if attempt >= retries:
-                raise
+                raise HTTPException(status_code=503, detail=f"Supabase temporarily unavailable: {type(e).__name__}")
             await anyio.sleep(0.25 * (attempt + 1))
 
 def _safe_data(res):
@@ -182,11 +184,16 @@ async def get_my_profile(authorization: str | None = Header(default=None)):
         .eq("user_id", user_id)
         .maybe_single()
     )
-    res = await _execute(q)
-    data = _safe_data(res)
-    if not data:
-        return {"user_id": user_id, "full_name": "", "phone": "", "city": "", "location_id": None}
-    return data
+    try:
+        res = await _execute(q)
+        data = _safe_data(res)
+        if not data:
+            return {"user_id": user_id, "full_name": "", "phone": "", "city": "", "location_id": None}
+        return data
+    except HTTPException as e:
+        if e.status_code == 503:
+            return {"user_id": user_id, "full_name": "", "phone": "", "city": "", "location_id": None}
+        raise
 
 @router.put("/me/profile", response_model=ProfileResponse)
 async def update_my_profile(profile: ProfileCreate, authorization: str | None = Header(default=None)):
