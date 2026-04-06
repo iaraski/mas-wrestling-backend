@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException
 from typing import List, Optional
 from uuid import UUID
 from app.core.supabase import supabase
+from app.core.rest import rest_get
 from pydantic import BaseModel
 import anyio
 from app.core.cache import cache
@@ -26,36 +27,60 @@ async def get_locations(type: Optional[str] = None, parent_id: Optional[str] = N
     if cached is not None:
         return cached
 
-    query = supabase.table("locations").select("*")
+    params = {"select": "*", "order": "name.asc"}
     if type:
-        query = query.eq("type", type)
+        params["type"] = f"eq.{type}"
     if parent_id:
-        query = query.eq("parent_id", parent_id)
-    
-    # Сортировка по имени
-    response = await anyio.to_thread.run_sync(query.order("name").execute)
-    data = response.data
+        params["parent_id"] = f"eq.{parent_id}"
+    try:
+        resp = await rest_get("locations", params, write=False)
+        data = resp.json()
+    except Exception:
+        query = supabase.table("locations").select("*")
+        if type:
+            query = query.eq("type", type)
+        if parent_id:
+            query = query.eq("parent_id", parent_id)
+        response = await anyio.to_thread.run_sync(query.order("name").execute)
+        data = response.data
     cache.set(cache_key, data, ttl_seconds=60.0)
     return data
 
 
 @router.get("/path", response_model=LocationPath)
 async def get_location_path(location_id: str):
-    cache_key = f"locations:path:{location_id}"
+    cache_key = f"locations:path:v2:{location_id}"
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
 
-    def _fetch(loc_id: str):
-        q = supabase.table("locations").select("id,type,parent_id").eq("id", loc_id).maybe_single()
-        return q.execute()
+    async def _fetch_loc(loc_id: str) -> dict:
+        try:
+            resp = await rest_get(
+                "locations",
+                {"select": "id,type,parent_id", "id": f"eq.{loc_id}"},
+                write=False,
+            )
+            j = resp.json()
+            row = (j[0] if isinstance(j, list) and j else {}) if isinstance(j, list) else (j or {})
+            return row or {}
+        except Exception:
+            def _fetch_sync(lid: str):
+                q = (
+                    supabase.table("locations")
+                    .select("id,type,parent_id")
+                    .eq("id", lid)
+                    .maybe_single()
+                )
+                return q.execute()
+
+            res = await anyio.to_thread.run_sync(_fetch_sync, loc_id)
+            return res.data or {}
 
     try:
-        res = await anyio.to_thread.run_sync(_fetch, location_id)
+        loc = await _fetch_loc(location_id)
     except Exception:
         raise HTTPException(status_code=500, detail="Failed to load location")
-
-    loc = res.data or {}
     if not loc:
         raise HTTPException(status_code=404, detail="Location not found")
 
@@ -70,8 +95,7 @@ async def get_location_path(location_id: str):
         if parent_id:
             district_id = str(parent_id)
             try:
-                dres = await anyio.to_thread.run_sync(_fetch, district_id)
-                dloc = dres.data or {}
+                dloc = await _fetch_loc(district_id)
                 parent2 = dloc.get("parent_id")
                 if parent2:
                     country_id = str(parent2)

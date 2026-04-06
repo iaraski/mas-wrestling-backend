@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Header, Body, Query
 from fastapi.responses import RedirectResponse
 from app.core.supabase import SUPABASE_URL, SUPABASE_KEY, SUPABASE_SERVICE_ROLE_KEY, admin_supabase
 from app.core.telegram import send_telegram_notification
+from app.core.rest import rest_get
 import httpx
 import os
 import secrets
@@ -81,16 +82,45 @@ def _check_tg_confirm_sig(telegram_id: int, email: str, sig: str | None) -> bool
     return hmac.compare_digest(expected, sig)
 
 async def _get_auth_user_by_email(email: str) -> dict | None:
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"{SUPABASE_URL}/auth/v1/admin/users",
-            headers={"Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}", "apikey": SUPABASE_KEY},
-            params={"email": email},
-        )
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    users_list = resp.json().get("users", [])
-    return users_list[0] if users_list else None
+    email_norm = _norm_email(email)
+    if not email_norm:
+        return None
+
+    def _extract_users(payload: dict) -> list[dict]:
+        users = payload.get("users")
+        if isinstance(users, list):
+            return [u for u in users if isinstance(u, dict)]
+        return []
+
+    try:
+        timeout = httpx.Timeout(20.0, connect=8.0)
+        async with httpx.AsyncClient(
+            timeout=timeout, http2=False, transport=httpx.AsyncHTTPTransport(retries=2)
+        ) as client:
+            for page in range(1, 11):
+                resp = await client.get(
+                    f"{SUPABASE_URL}/auth/v1/admin/users",
+                    headers={
+                        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                        "apikey": SUPABASE_KEY,
+                    },
+                    params={"page": page, "per_page": 200},
+                )
+                if resp.status_code != 200:
+                    raise HTTPException(status_code=resp.status_code, detail=resp.text)
+                users = _extract_users(resp.json() if resp.content else {})
+                for u in users:
+                    if _norm_email(str(u.get("email") or "")) == email_norm:
+                        return u
+                if len(users) < 200:
+                    break
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=503, detail=f"Supabase Auth unavailable: {type(e).__name__}")
+
+    return None
+
+def _norm_email(email: str) -> str:
+    return email.strip().lower()
 
 @router.get("/me")
 async def get_me(authorization: str | None = Header(default=None)):
@@ -130,15 +160,34 @@ async def get_me(authorization: str | None = Header(default=None)):
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    res = admin_supabase.table("users").select(
-        "id, email, user_roles(roles(code))"
-    ).eq("id", user_id).maybe_single().execute()
+    res_data = None
+    try:
+        resp = await rest_get(
+            "users",
+            {"select": "id,email,user_roles(roles(code))", "id": f"eq.{user_id}", "limit": "1"},
+            write=True,
+        )
+        rows = resp.json()
+        if isinstance(rows, list) and rows:
+            res_data = rows[0]
+    except Exception:
+        res_data = None
+
+    if res_data is None:
+        res = (
+            admin_supabase.table("users")
+            .select("id, email, user_roles(roles(code))")
+            .eq("id", user_id)
+            .maybe_single()
+            .execute()
+        )
+        res_data = res.data if res and hasattr(res, "data") else None
 
     role_codes: list[str] = []
-    if res.data and res.data.get("user_roles"):
+    if res_data and res_data.get("user_roles"):
         role_codes = [
             ur.get("roles", {}).get("code")
-            for ur in res.data.get("user_roles", [])
+            for ur in res_data.get("user_roles", [])
             if ur and ur.get("roles") and ur.get("roles", {}).get("code")
         ]
         
@@ -156,7 +205,7 @@ async def get_me(authorization: str | None = Header(default=None)):
 
     result = {
         "user_id": user_id,
-        "email": res.data.get("email") if res.data else user_data.get("email"),
+        "email": res_data.get("email") if res_data else user_data.get("email"),
         "role_codes": role_codes,
         "role": primary_role,
     }

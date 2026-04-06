@@ -12,5 +12,7 @@ COPY . .
 # Expose port
 EXPOSE 8000
 
-# Command to run the application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Command to run the application (production)
+# Default to 4 workers; can be overridden via GUNICORN_WORKERS build/run env
+ENV GUNICORN_WORKERS=4
+CMD ["bash", "-lc", "gunicorn -k uvicorn.workers.UvicornWorker -w ${GUNICORN_WORKERS} -b 0.0.0.0:8000 --keep-alive 30 --timeout 60 app.main:app"]

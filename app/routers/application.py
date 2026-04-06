@@ -22,6 +22,44 @@ def _applications_open_now() -> bool:
     now = datetime.now(_MSK_TZ)
     return now < _APPLICATION_DEADLINE
 
+def _category_group(gender: str | None, age_min: int | None, age_max: int | None) -> str:
+    g = (gender or "").lower()
+    is_male = g == "male" or g == "m"
+    is_female = g == "female" or g == "f"
+    if age_min == 18 and age_max == 21:
+        return "Юниоры" if is_male else "Юниорки" if is_female else "Юниоры"
+    if age_max is not None and age_max < 18:
+        return "Юноши" if is_male else "Девушки" if is_female else "Юноши"
+    return "Мужчины" if is_male else "Женщины" if is_female else "Мужчины"
+
+def _weight_label(weight_min: float | int | None, weight_max: float | int | None) -> str:
+    try:
+        if weight_max is None or float(weight_max) >= 999:
+            if not weight_min:
+                return "абсолютная"
+            return f"{int(float(weight_min))}+ кг"
+        return f"до {weight_max} кг"
+    except Exception:
+        return "—"
+
+def _birth_years_label(age_min: int | None, age_max: int | None, at_date: str | None) -> str | None:
+    if age_min is None or age_max is None:
+        return None
+    try:
+        year = datetime.fromisoformat(str(at_date).replace("Z", "+00:00")).year if at_date else datetime.now(_MSK_TZ).year
+    except Exception:
+        year = datetime.now(_MSK_TZ).year
+    return f"{year - age_max}-{year - age_min} г.р."
+
+def _format_category_label(cat: dict, at_date: str | None) -> str:
+    try:
+        group = _category_group(cat.get("gender"), cat.get("age_min"), cat.get("age_max"))
+        years = _birth_years_label(cat.get("age_min"), cat.get("age_max"), at_date)
+        weight = _weight_label(cat.get("weight_min"), cat.get("weight_max"))
+        return f"{group} {years}, {weight}" if years else f"{group}, {weight}"
+    except Exception:
+        return "Неизвестная категория"
+
 async def _get_role_codes(user_id: str) -> list[str]:
     if not admin_supabase:
         return []
@@ -129,7 +167,9 @@ async def get_applications(competition_id: Optional[UUID] = None):
     try:
         # Запрашиваем заявки с данными спортсмена (ФИО из профиля через athletes -> users -> profiles) и данными категории
         # Используем явное имя отношения (FK), так как Supabase нашел несколько связей
-        query = supabase.table("applications").select("*, athletes(users!athletes_user_id_fkey(profiles(full_name))), competition_categories(*)")
+        query = supabase.table("applications").select(
+            "*, competition:competitions(start_date), athletes(users!athletes_user_id_fkey(profiles(full_name))), competition_categories(*)"
+        )
         if competition_id:
             query = query.eq("competition_id", competition_id)
         response = query.execute()
@@ -152,14 +192,9 @@ async def get_applications(competition_id: Optional[UUID] = None):
             try:
                 if app.get("competition_categories"):
                     cat = app["competition_categories"]
-                    gender = "М" if cat["gender"] == "male" else "Ж"
-                    
-                    if cat.get('weight_max') == 999:
-                        weight_str = f"{int(cat.get('weight_min'))}+ кг"
-                    else:
-                        weight_str = f"до {cat['weight_max']} кг" if cat.get('weight_max') else f"свыше {cat.get('weight_min')} кг"
-                        
-                    category_desc = f"{gender}, {cat['age_min']}-{cat['age_max']} лет, {weight_str}"
+                    comp = app.get("competition") or {}
+                    at_date = comp.get("start_date") if isinstance(comp, dict) else None
+                    category_desc = _format_category_label(cat, at_date)
             except Exception as e:
                 print(f"[Applications] Error parsing category for app {app.get('id')}: {e}")
 
@@ -296,14 +331,11 @@ async def get_application_details(app_id: UUID, authorization: str | None = Head
             if cat:
                 if isinstance(cat, list):
                     cat = cat[0] if cat else {}
-                gender = "М" if cat.get("gender") == "male" else "Ж"
-                
-                if cat.get('weight_max') == 999:
-                    weight_str = f"{int(cat.get('weight_min'))}+ кг"
-                else:
-                    weight_str = f"до {cat.get('weight_max')} кг" if cat.get("weight_max") else f"свыше {cat.get('weight_min')} кг"
-                    
-                category_desc = f"{gender}, {cat.get('age_min')}-{cat.get('age_max')} лет, {weight_str}"
+                comp = app_data.get("competition") or app_data.get("competitions") or {}
+                if isinstance(comp, list):
+                    comp = comp[0] if comp else {}
+                at_date = comp.get("start_date") if isinstance(comp, dict) else None
+                category_desc = _format_category_label(cat, at_date)
         except Exception as e:
             print(f"Error parsing category in details: {e}")
         app_data["category_description"] = category_desc
@@ -357,6 +389,13 @@ async def create_my_application(
     authorization: str | None = Header(default=None),
     user_id: str | None = None,
 ):
+    try:
+        from app.core.ratelimit import allow as rl_allow
+        uid_for_rl = user_id or "anon"
+        if not rl_allow(f"apply:{uid_for_rl}", rate_per_minute=15.0, burst=30.0):
+            raise HTTPException(status_code=429, detail="Too many application requests, please try again shortly")
+    except Exception:
+        pass
     if authorization:
         user_id = await _get_user_id_from_bearer(authorization)
     if not user_id:
@@ -375,11 +414,32 @@ async def create_my_application(
         raise HTTPException(status_code=404, detail="Athlete not found")
         
     athlete_id = athlete_res.data["id"]
+
+    prof_res = admin_supabase.table("profiles").select("full_name,city,location_id").eq("user_id", user_id).maybe_single().execute()
+    prof = prof_res.data or {}
+    pass_res = admin_supabase.table("passports").select("birth_date,rank,photo_url,gender").eq("athlete_id", str(athlete_id)).maybe_single().execute()
+    passport = pass_res.data or {}
+
+    coach_res = admin_supabase.table("athletes").select("coach_name").eq("id", str(athlete_id)).maybe_single().execute()
+    coach = coach_res.data or {}
+
+    if not prof.get("full_name") or not prof.get("city") or not prof.get("location_id"):
+        raise HTTPException(status_code=400, detail="Fill full_name, city and region")
+    if not coach.get("coach_name"):
+        raise HTTPException(status_code=400, detail="Fill coach name")
+    if not passport.get("birth_date") or not passport.get("rank") or not passport.get("photo_url") or not passport.get("gender"):
+        raise HTTPException(status_code=400, detail="Fill birth_date, gender, rank and upload photo")
     
-    # Check if already applied
-    existing = admin_supabase.table("applications").select("id").eq("athlete_id", athlete_id).eq("category_id", category_id).execute()
+    # Check if already applied to this competition (only one application per competition)
+    existing = (
+        admin_supabase.table("applications")
+        .select("id")
+        .eq("athlete_id", athlete_id)
+        .eq("competition_id", competition_id)
+        .execute()
+    )
     if existing.data:
-        raise HTTPException(status_code=400, detail="Already applied to this category")
+        raise HTTPException(status_code=400, detail="Already applied to this competition")
         
     res = admin_supabase.table("applications").insert({
         "competition_id": competition_id,
@@ -387,7 +447,15 @@ async def create_my_application(
         "category_id": category_id,
         "status": "pending"
     }).execute()
-    
+
+    try:
+        admin_supabase.table("registrations").upsert(
+            {"user_id": user_id, "stage": "complete", "consent_accepted": True},
+            on_conflict="user_id",
+        ).execute()
+    except Exception:
+        pass
+
     return res.data[0]
 
 
