@@ -743,28 +743,48 @@ async def admin_update_athlete_profile(
 
     email = str(body.email or "").strip().lower() if body.email is not None else None
     if email:
-        await rest_patch("users", {"id": f"eq.{user_id}"}, {"email": email}, prefer="return=minimal")
+        current_email = None
+        try:
+            cur = await rest_get(
+                "users",
+                {"select": "email", "id": f"eq.{user_id}", "limit": "1"},
+                write=True,
+            )
+            cur_rows = cur.json()
+            if isinstance(cur_rows, list) and cur_rows and isinstance(cur_rows[0], dict):
+                current_email = str(cur_rows[0].get("email") or "").strip().lower() or None
+        except Exception:
+            current_email = None
+
+        if current_email != email:
+            await rest_patch("users", {"id": f"eq.{user_id}"}, {"email": email}, prefer="return=minimal")
         if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=8.0)) as client:
-                upd = await client.patch(
-                    f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
-                    json={"email": email, "email_confirm": True},
-                    headers={
-                        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                        "Content-Type": "application/json",
-                    },
-                )
-                if upd.status_code in (200, 201):
-                    pass
-                elif upd.status_code == 404:
-                    pass
-                else:
-                    t = (upd.text or "").lower()
-                    if "user not found" in t or "not found" in t:
+            if current_email != email:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=8.0)) as client:
+                    upd = await client.patch(
+                        f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+                        json={"email": email, "email_confirm": True},
+                        headers={
+                            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                            "Content-Type": "application/json",
+                        },
+                    )
+                    if upd.status_code in (200, 201, 204):
+                        pass
+                    elif upd.status_code == 404:
                         pass
                     else:
-                        raise HTTPException(status_code=400, detail=f"Failed to update auth email: {upd.text}")
+                        t = (upd.text or "").strip()
+                        tl = t.lower()
+                        if "user not found" in tl or "not found" in tl:
+                            pass
+                        else:
+                            msg = t or f"status {upd.status_code}"
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Failed to update auth email ({upd.status_code}): {msg}",
+                            )
 
     prof_payload: dict[str, object] = {
         "user_id": user_id,
