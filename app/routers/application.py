@@ -755,8 +755,16 @@ async def admin_update_athlete_profile(
                         "Content-Type": "application/json",
                     },
                 )
-                if upd.status_code not in (200, 201):
-                    raise HTTPException(status_code=400, detail=f"Failed to update auth email: {upd.text}")
+                if upd.status_code in (200, 201):
+                    pass
+                elif upd.status_code == 404:
+                    pass
+                else:
+                    t = (upd.text or "").lower()
+                    if "user not found" in t or "not found" in t:
+                        pass
+                    else:
+                        raise HTTPException(status_code=400, detail=f"Failed to update auth email: {upd.text}")
 
     prof_payload: dict[str, object] = {
         "user_id": user_id,
