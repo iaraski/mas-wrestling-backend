@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from typing import List, Dict, Any
 from uuid import UUID
-from app.core.supabase import supabase
+from app.core.rest import rest_get, rest_post, rest_patch, rest_delete
 
 router = APIRouter(prefix="/bouts", tags=["bouts"])
 
@@ -9,10 +9,18 @@ router = APIRouter(prefix="/bouts", tags=["bouts"])
 async def get_competition_bouts(comp_id: UUID):
     try:
         # Fetch bouts with athlete names and category info
-        query = supabase.table("bouts").select(
-            "*, red_athlete:applications!red_athlete_id(athlete_name), blue_athlete:applications!blue_athlete_id(athlete_name), category:competition_categories(*)"
-        ).eq("competition_id", str(comp_id)).order("mat_number").order("bout_order").execute()
-        return query.data
+        resp = await rest_get(
+            "bouts",
+            {
+                "select": "*,red_athlete:applications!red_athlete_id(athlete_name),blue_athlete:applications!blue_athlete_id(athlete_name),category:competition_categories(*)",
+                "competition_id": f"eq.{str(comp_id)}",
+                "order": "mat_number.asc,bout_order.asc",
+                "limit": "10000",
+            },
+            write=True,
+        )
+        rows = resp.json()
+        return rows if isinstance(rows, list) else []
     except Exception as e:
         print(f"Error fetching bouts: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -24,11 +32,17 @@ async def update_bout(bout_id: UUID, data: Dict[str, Any]):
         if "status" in data and data["status"] not in ["pending", "active", "completed"]:
             raise HTTPException(status_code=400, detail="Invalid status")
             
-        update_res = supabase.table("bouts").update(data).eq("id", str(bout_id)).execute()
-        if not update_res.data:
+        upd = await rest_patch(
+            "bouts",
+            {"id": f"eq.{str(bout_id)}"},
+            data,
+            prefer="return=representation",
+        )
+        upd_rows = upd.json()
+        if not isinstance(upd_rows, list) or not upd_rows:
             raise HTTPException(status_code=404, detail="Bout not found")
             
-        bout = update_res.data[0]
+        bout = upd_rows[0]
         
         # If bout is completed and has a winner, we might need to advance them to the next bout
         if bout.get("status") == "completed" and bout.get("winner_id"):
@@ -37,20 +51,52 @@ async def update_bout(bout_id: UUID, data: Dict[str, Any]):
             
             # Advance winner
             if bout.get("next_bout_id_winner"):
-                next_bout_w = supabase.table("bouts").select("*").eq("id", bout["next_bout_id_winner"]).single().execute().data
+                next_resp = await rest_get(
+                    "bouts",
+                    {"select": "*", "id": f"eq.{str(bout['next_bout_id_winner'])}", "limit": "1"},
+                    write=True,
+                )
+                next_rows = next_resp.json()
+                next_bout_w = next_rows[0] if isinstance(next_rows, list) and next_rows else {}
                 # Place in empty slot
                 if not next_bout_w.get("red_athlete_id"):
-                    supabase.table("bouts").update({"red_athlete_id": winner_id}).eq("id", bout["next_bout_id_winner"]).execute()
+                    await rest_patch(
+                        "bouts",
+                        {"id": f"eq.{str(bout['next_bout_id_winner'])}"},
+                        {"red_athlete_id": winner_id},
+                        prefer="return=minimal",
+                    )
                 elif not next_bout_w.get("blue_athlete_id"):
-                    supabase.table("bouts").update({"blue_athlete_id": winner_id}).eq("id", bout["next_bout_id_winner"]).execute()
+                    await rest_patch(
+                        "bouts",
+                        {"id": f"eq.{str(bout['next_bout_id_winner'])}"},
+                        {"blue_athlete_id": winner_id},
+                        prefer="return=minimal",
+                    )
                     
             # Advance loser
             if bout.get("next_bout_id_loser"):
-                next_bout_l = supabase.table("bouts").select("*").eq("id", bout["next_bout_id_loser"]).single().execute().data
+                next_resp = await rest_get(
+                    "bouts",
+                    {"select": "*", "id": f"eq.{str(bout['next_bout_id_loser'])}", "limit": "1"},
+                    write=True,
+                )
+                next_rows = next_resp.json()
+                next_bout_l = next_rows[0] if isinstance(next_rows, list) and next_rows else {}
                 if not next_bout_l.get("red_athlete_id"):
-                    supabase.table("bouts").update({"red_athlete_id": loser_id}).eq("id", bout["next_bout_id_loser"]).execute()
+                    await rest_patch(
+                        "bouts",
+                        {"id": f"eq.{str(bout['next_bout_id_loser'])}"},
+                        {"red_athlete_id": loser_id},
+                        prefer="return=minimal",
+                    )
                 elif not next_bout_l.get("blue_athlete_id"):
-                    supabase.table("bouts").update({"blue_athlete_id": loser_id}).eq("id", bout["next_bout_id_loser"]).execute()
+                    await rest_patch(
+                        "bouts",
+                        {"id": f"eq.{str(bout['next_bout_id_loser'])}"},
+                        {"blue_athlete_id": loser_id},
+                        prefer="return=minimal",
+                    )
                     
         return bout
     except Exception as e:
@@ -64,22 +110,52 @@ async def generate_brackets(comp_id: UUID):
         # Currently, it acts as a placeholder to delete old bouts and trigger the generation script.
         
         # 1. Delete old bouts
-        supabase.table("bouts").delete().eq("competition_id", str(comp_id)).execute()
+        await rest_delete("bouts", {"competition_id": f"eq.{str(comp_id)}"})
         
         # 2. Get Competition Data
-        comp_res = supabase.table("competitions").select("*").eq("id", str(comp_id)).single().execute()
-        comp = comp_res.data
+        comp_resp = await rest_get(
+            "competitions",
+            {"select": "*", "id": f"eq.{str(comp_id)}", "limit": "1"},
+            write=True,
+        )
+        comp_rows = comp_resp.json()
+        comp = comp_rows[0] if isinstance(comp_rows, list) and comp_rows else None
+        if not isinstance(comp, dict):
+            raise HTTPException(status_code=404, detail="Competition not found")
         mats_count = comp.get("mats_count") or 1
         
         # 3. Get Categories
-        cats_res = supabase.table("competition_categories").select("*").eq("competition_id", str(comp_id)).execute()
-        categories = cats_res.data
+        cats_resp = await rest_get(
+            "competition_categories",
+            {"select": "*", "competition_id": f"eq.{str(comp_id)}", "limit": "10000"},
+            write=True,
+        )
+        categories = cats_resp.json()
+        if not isinstance(categories, list):
+            categories = []
         
         # 4. Fetch participants for each category
-        cat_participants = {}
-        for cat in categories:
-            apps_res = supabase.table("applications").select("id, draw_number").eq("category_id", cat["id"]).eq("status", "weighed").order("draw_number").execute()
-            cat_participants[cat["id"]] = [app["id"] for app in apps_res.data]
+        apps_resp = await rest_get(
+            "applications",
+            {
+                "select": "id,category_id,draw_number",
+                "competition_id": f"eq.{str(comp_id)}",
+                "status": "eq.weighed",
+                "order": "draw_number.asc",
+                "limit": "10000",
+            },
+            write=True,
+        )
+        apps_rows = apps_resp.json()
+        cat_participants: dict[str, list[str]] = {}
+        if isinstance(apps_rows, list):
+            for app in apps_rows:
+                if not isinstance(app, dict):
+                    continue
+                cid = app.get("category_id")
+                aid = app.get("id")
+                if cid and aid:
+                    cat_participants.setdefault(str(cid), []).append(str(aid))
             
         # 5. Simple Mat distribution logic
         # Sort categories by size
@@ -103,7 +179,7 @@ async def generate_brackets(comp_id: UUID):
             # Supabase API has a limit, we might need to chunk it if there are thousands
             for i in range(0, len(bouts_to_insert), 100):
                 chunk = bouts_to_insert[i:i+100]
-                supabase.table("bouts").insert(chunk).execute()
+                await rest_post("bouts", {}, chunk, prefer="return=minimal")
                 
         return {"status": "success", "message": f"Generated {len(bouts_to_insert)} bouts"}
         

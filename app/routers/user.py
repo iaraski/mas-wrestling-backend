@@ -565,6 +565,22 @@ async def get_my_profile(authorization: str | None = Header(default=None)):
     if not admin_supabase:
         raise HTTPException(status_code=500, detail="Service role not configured")
     user_id = await _get_user_id_from_bearer(authorization)
+    try:
+        resp = await rest_get(
+            "profiles",
+            {
+                "select": "id,user_id,full_name,phone,city,location_id,created_at",
+                "user_id": f"eq.{user_id}",
+                "limit": "1",
+            },
+            write=True,
+        )
+        rows = resp.json()
+        if isinstance(rows, list) and rows:
+            return rows[0]
+    except Exception:
+        pass
+
     q = (
         admin_supabase.table("profiles")
         .select("id,user_id,full_name,phone,city,location_id,created_at")
@@ -581,6 +597,47 @@ async def get_my_profile(authorization: str | None = Header(default=None)):
         if e.status_code in (400, 503):
             return {"user_id": user_id, "full_name": "", "phone": "", "city": "", "location_id": None}
         raise
+
+
+async def _get_location_path_v2(location_id: str) -> dict:
+    resp = await rest_get(
+        "locations",
+        {"select": "id,type,parent_id", "id": f"eq.{location_id}", "limit": "1"},
+        write=False,
+    )
+    rows = resp.json()
+    loc = rows[0] if isinstance(rows, list) and rows else None
+    if not isinstance(loc, dict) or not loc.get("id"):
+        return {"country_id": None, "district_id": None, "region_id": None}
+
+    loc_type = str(loc.get("type") or "")
+    region_id: str | None = None
+    district_id: str | None = None
+    country_id: str | None = None
+
+    if loc_type == "region":
+        region_id = str(loc.get("id"))
+        parent_id = loc.get("parent_id")
+        if parent_id:
+            district_id = str(parent_id)
+            d_resp = await rest_get(
+                "locations",
+                {"select": "id,parent_id", "id": f"eq.{district_id}", "limit": "1"},
+                write=False,
+            )
+            d_rows = d_resp.json()
+            dloc = d_rows[0] if isinstance(d_rows, list) and d_rows else None
+            if isinstance(dloc, dict) and dloc.get("parent_id"):
+                country_id = str(dloc["parent_id"])
+    elif loc_type == "district":
+        district_id = str(loc.get("id"))
+        parent_id = loc.get("parent_id")
+        if parent_id:
+            country_id = str(parent_id)
+    elif loc_type == "country":
+        country_id = str(loc.get("id"))
+
+    return {"country_id": country_id, "district_id": district_id, "region_id": region_id}
 
 @router.put("/me/profile", response_model=ProfileResponse)
 async def update_my_profile(profile: ProfileCreate, authorization: str | None = Header(default=None)):
@@ -611,24 +668,44 @@ async def get_my_athlete(authorization: str | None = Header(default=None)):
         raise HTTPException(status_code=500, detail="Service role not configured")
     user_id = await _get_user_id_from_bearer(authorization)
     try:
+        resp = await rest_get(
+            "athletes",
+            {"select": "id,user_id,coach_name", "user_id": f"eq.{user_id}", "limit": "1"},
+            write=True,
+        )
+        rows = resp.json()
+        if isinstance(rows, list) and rows:
+            a = rows[0]
+            athlete_id = str(a.get("id") or "")
+            passports = []
+            if athlete_id:
+                p_resp = await rest_get(
+                    "passports",
+                    {"select": "*", "athlete_id": f"eq.{athlete_id}", "limit": "100"},
+                    write=True,
+                )
+                p_rows = p_resp.json()
+                passports = p_rows if isinstance(p_rows, list) else []
+            a["passports"] = passports
+            return a
+    except Exception:
+        pass
+
+    try:
         q = admin_supabase.table("athletes").select("*, passports(*)").eq("user_id", user_id).maybe_single()
         res = await _execute(q)
         data = _safe_data(res)
-        if not data:
-            return {
-                "id": "00000000-0000-0000-0000-000000000000",
-                "user_id": user_id,
-                "coach_name": "",
-                "passports": [],
-            }
-        return data
+        if data:
+            return data
     except Exception:
-        return {
-            "id": "00000000-0000-0000-0000-000000000000",
-            "user_id": user_id,
-            "coach_name": "",
-            "passports": [],
-        }
+        pass
+
+    return {
+        "id": "00000000-0000-0000-0000-000000000000",
+        "user_id": user_id,
+        "coach_name": "",
+        "passports": [],
+    }
 
 @router.put("/me/athlete")
 async def update_my_athlete(coach_name: Optional[str] = None, authorization: str | None = Header(default=None)):
@@ -653,6 +730,37 @@ async def get_my_details(authorization: str | None = Header(default=None)):
         raise HTTPException(status_code=500, detail="Service role not configured")
     user_id = await _get_user_id_from_bearer(authorization)
     try:
+        a_resp = await rest_get(
+            "athletes",
+            {"select": "id", "user_id": f"eq.{user_id}", "limit": "1"},
+            write=True,
+        )
+        a_rows = a_resp.json()
+        if not isinstance(a_rows, list) or not a_rows or not a_rows[0].get("id"):
+            return {"birth_date": None, "rank": None, "photo_url": None, "gender": None}
+        athlete_id = str(a_rows[0]["id"])
+
+        p_resp = await rest_get(
+            "passports",
+            {
+                "select": "birth_date,rank,photo_url,gender",
+                "athlete_id": f"eq.{athlete_id}",
+                "limit": "1",
+            },
+            write=True,
+        )
+        p_rows = p_resp.json()
+        p = p_rows[0] if isinstance(p_rows, list) and p_rows else {}
+        return {
+            "birth_date": p.get("birth_date") if isinstance(p, dict) else None,
+            "rank": p.get("rank") if isinstance(p, dict) else None,
+            "photo_url": p.get("photo_url") if isinstance(p, dict) else None,
+            "gender": p.get("gender") if isinstance(p, dict) else None,
+        }
+    except Exception:
+        pass
+
+    try:
         athlete_res = await _execute(
             admin_supabase.table("athletes").select("id").eq("user_id", user_id).maybe_single()
         )
@@ -675,6 +783,125 @@ async def get_my_details(authorization: str | None = Header(default=None)):
         }
     except Exception:
         return {"birth_date": None, "rank": None, "photo_url": None, "gender": None}
+
+
+@router.get("/me/dashboard")
+async def get_my_dashboard(authorization: str | None = Header(default=None)):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    user_id = await _get_user_id_from_bearer(authorization)
+
+    async def _fetch_registration() -> dict:
+        try:
+            r = await rest_get(
+                "registrations",
+                {"select": "stage,consent_accepted,updated_at", "user_id": f"eq.{user_id}", "limit": "1"},
+                write=True,
+            )
+            rows = r.json()
+            row = rows[0] if isinstance(rows, list) and rows else {}
+            stage = row.get("stage") if isinstance(row, dict) else None
+            if not stage:
+                stage = "start"
+            return {"user_id": user_id, "stage": stage, "locked": bool(stage == "complete")}
+        except Exception:
+            return {"user_id": user_id, "stage": "start", "locked": False}
+
+    async def _fetch_profile() -> dict:
+        try:
+            r = await rest_get(
+                "profiles",
+                {
+                    "select": "id,user_id,full_name,phone,city,location_id,created_at",
+                    "user_id": f"eq.{user_id}",
+                    "limit": "1",
+                },
+                write=True,
+            )
+            rows = r.json()
+            if isinstance(rows, list) and rows:
+                return rows[0]
+        except Exception:
+            pass
+        return {"user_id": user_id, "full_name": "", "phone": "", "city": "", "location_id": None}
+
+    async def _fetch_athlete() -> dict:
+        try:
+            r = await rest_get(
+                "athletes",
+                {"select": "id,user_id,coach_name", "user_id": f"eq.{user_id}", "limit": "1"},
+                write=True,
+            )
+            rows = r.json()
+            if isinstance(rows, list) and rows:
+                return rows[0]
+        except Exception:
+            pass
+        return {"id": None, "user_id": user_id, "coach_name": ""}
+
+    async def _fetch_details(athlete_id: str | None) -> dict:
+        if not athlete_id:
+            return {"birth_date": None, "rank": None, "photo_url": None, "gender": None}
+        try:
+            r = await rest_get(
+                "passports",
+                {
+                    "select": "birth_date,rank,photo_url,gender",
+                    "athlete_id": f"eq.{athlete_id}",
+                    "limit": "1",
+                },
+                write=True,
+            )
+            rows = r.json()
+            p = rows[0] if isinstance(rows, list) and rows else {}
+            return {
+                "birth_date": p.get("birth_date") if isinstance(p, dict) else None,
+                "rank": p.get("rank") if isinstance(p, dict) else None,
+                "photo_url": p.get("photo_url") if isinstance(p, dict) else None,
+                "gender": p.get("gender") if isinstance(p, dict) else None,
+            }
+        except Exception:
+            return {"birth_date": None, "rank": None, "photo_url": None, "gender": None}
+
+    registration: dict = {}
+    profile: dict = {}
+    athlete: dict = {}
+
+    async with anyio.create_task_group() as tg:
+        async def _run_reg():
+            nonlocal registration
+            registration = await _fetch_registration()
+
+        async def _run_profile():
+            nonlocal profile
+            profile = await _fetch_profile()
+
+        async def _run_athlete():
+            nonlocal athlete
+            athlete = await _fetch_athlete()
+
+        tg.start_soon(_run_reg)
+        tg.start_soon(_run_profile)
+        tg.start_soon(_run_athlete)
+
+    athlete_id = str(athlete.get("id") or "") if isinstance(athlete, dict) else ""
+    details = await _fetch_details(athlete_id or None)
+
+    location_path = None
+    loc_id = profile.get("location_id") if isinstance(profile, dict) else None
+    if loc_id:
+        try:
+            location_path = await _get_location_path_v2(str(loc_id))
+        except Exception:
+            location_path = None
+
+    return {
+        "registration": registration,
+        "profile": profile,
+        "athlete": athlete,
+        "details": details,
+        "location_path": location_path,
+    }
 
 
 @router.put("/me/details")
@@ -902,19 +1129,30 @@ async def get_my_applications(authorization: str | None = Header(default=None)):
         raise HTTPException(status_code=500, detail="Service role not configured")
     user_id = await _get_user_id_from_bearer(authorization)
     try:
-        athlete_res = await _execute(admin_supabase.table("athletes").select("id").eq("user_id", user_id).maybe_single())
-        athlete_data = _safe_data(athlete_res)
-        if not athlete_data:
+        athlete_resp = await rest_get(
+            "athletes",
+            {"select": "id", "user_id": f"eq.{user_id}", "limit": "1"},
+            write=True,
+        )
+        athlete_rows = athlete_resp.json()
+        if not isinstance(athlete_rows, list) or not athlete_rows or not athlete_rows[0].get("id"):
             return []
+        athlete_id = str(athlete_rows[0]["id"])
+
+        apps_resp = await rest_get(
+            "applications",
+            {
+                "select": "id,status,draw_number,created_at,category_id,competitions(id,name,start_date),competition_categories(gender,age_min,age_max,weight_min,weight_max)",
+                "athlete_id": f"eq.{athlete_id}",
+                "order": "created_at.desc",
+                "limit": "1000",
+            },
+            write=True,
+        )
+        rows = apps_resp.json()
+        return rows if isinstance(rows, list) else []
     except Exception:
         return []
-    
-    athlete_id = athlete_data["id"]
-    res = admin_supabase.table("applications").select(
-        "id, status, draw_number, created_at, category_id, competitions(id, name, start_date), competition_categories(gender, age_min, age_max, weight_min, weight_max)"
-    ).eq("athlete_id", athlete_id).order("created_at", desc=True).execute()
-    
-    return res.data
 
 @router.post("/admin-create/", response_model=UserProfile)
 @router.post("/admin-create", response_model=UserProfile)
@@ -954,8 +1192,9 @@ async def create_admin_user(payload: AdminCreate):
     user_id = getattr(auth_user, "id")
 
     try:
-        supabase.table("users").upsert({"id": user_id, "email": payload.email}, on_conflict="id").execute()
-        supabase.table("profiles").upsert(
+        await rest_upsert("users", {"id": user_id, "email": payload.email}, on_conflict="id")
+        await rest_upsert(
+            "profiles",
             {
                 "user_id": user_id,
                 "full_name": payload.full_name,
@@ -963,25 +1202,31 @@ async def create_admin_user(payload: AdminCreate):
                 "location_id": str(payload.location_id) if payload.location_id else None,
             },
             on_conflict="user_id",
-        ).execute()
+        )
 
-        roles_res = supabase.table("roles").select("id, code").in_("code", payload.role_codes).execute()
-        if not roles_res.data:
+        roles_resp = await rest_get(
+            "roles",
+            {"select": "id,code", "code": _pg_in([str(c) for c in payload.role_codes]), "limit": "1000"},
+            write=True,
+        )
+        roles_rows = roles_resp.json()
+        if not isinstance(roles_rows, list) or not roles_rows:
             raise HTTPException(status_code=400, detail="Invalid role codes")
 
-        supabase.table("user_roles").delete().eq("user_id", user_id).execute()
-        to_insert_roles = [{"user_id": str(user_id), "role_id": r["id"]} for r in roles_res.data]
-        supabase.table("user_roles").insert(to_insert_roles).execute()
+        await rest_delete("user_roles", {"user_id": f"eq.{user_id}"})
+        to_insert_roles = [{"user_id": str(user_id), "role_id": str(r["id"])} for r in roles_rows if r.get("id")]
+        if to_insert_roles:
+            await rest_post("user_roles", {}, to_insert_roles, prefer="return=minimal")
 
-        supabase.table("staff_locations").delete().eq("user_id", user_id).execute()
+        await rest_delete("staff_locations", {"user_id": f"eq.{user_id}"})
         if payload.location_id and (is_admin or is_secretary):
             to_insert_staff = [
                 {"user_id": str(user_id), "location_id": str(payload.location_id), "role_id": r["id"]}
-                for r in roles_res.data
-                if ("admin" in r["code"] or "secretary" in r["code"])
+                for r in roles_rows
+                if ("admin" in str(r.get("code") or "") or "secretary" in str(r.get("code") or ""))
             ]
             if to_insert_staff:
-                supabase.table("staff_locations").insert(to_insert_staff).execute()
+                await rest_post("staff_locations", {}, to_insert_staff, prefer="return=minimal")
     except Exception as e:
         print(f"Error inserting user details to public tables: {e}")
         # Если произошла ошибка при добавлении в публичные таблицы, стоит удалить пользователя из Auth
@@ -991,29 +1236,27 @@ async def create_admin_user(payload: AdminCreate):
             pass
         raise HTTPException(status_code=400, detail=f"Ошибка сохранения данных: {str(e)}")
 
-    res = supabase.table("users").select(
-        "id, email, profiles(full_name, phone), user_roles(roles(code)), staff_locations(location_id, locations(name))"
-    ).eq("id", user_id).single().execute()
-
-    u = res.data
-    profile = u.get("profiles")
-    if isinstance(profile, list):
-        profile = profile[0] if profile else None
-    roles = [ur["roles"]["code"] for ur in u.get("user_roles", []) if ur.get("roles")]
-    staff = u.get("staff_locations")
-    if isinstance(staff, list):
-        staff = staff[0] if staff else None
-
-    loc_id = staff.get("location_id") if staff else None
-    loc_name = staff.get("locations", {}).get("name") if staff and staff.get("locations") else None
+    loc_name = None
+    if payload.location_id:
+        try:
+            loc_resp = await rest_get(
+                "locations",
+                {"select": "name", "id": f"eq.{str(payload.location_id)}", "limit": "1"},
+                write=False,
+            )
+            loc_rows = loc_resp.json()
+            if isinstance(loc_rows, list) and loc_rows and isinstance(loc_rows[0], dict):
+                loc_name = loc_rows[0].get("name")
+        except Exception:
+            loc_name = None
 
     return UserProfile(
-        user_id=u["id"],
-        full_name=profile.get("full_name") if profile else None,
-        phone=profile.get("phone") if profile else None,
-        email=u.get("email"),
-        roles=roles,
-        location_id=loc_id,
+        user_id=str(user_id),
+        full_name=payload.full_name,
+        phone=payload.phone,
+        email=payload.email,
+        roles=[str(c) for c in payload.role_codes],
+        location_id=str(payload.location_id) if payload.location_id else None,
         location_name=loc_name,
     )
 
@@ -1228,29 +1471,71 @@ async def set_athlete_editable(
 
 @router.get("/roles", response_model=List[Role])
 async def get_roles():
-    response = supabase.table("roles").select("*").execute()
-    return response.data
+    resp = await rest_get("roles", {"select": "*", "limit": "1000"}, write=True)
+    rows = resp.json()
+    return rows if isinstance(rows, list) else []
 
 @router.get("/search", response_model=List[UserProfile])
 async def search_users(query: str):
-    res_users = supabase.table("users").select("id, telegram_id, email").ilike("telegram_id::text", f"%{query}%").execute()
-    user_ids_by_tg = [u["id"] for u in res_users.data]
-    
-    res_profiles = supabase.table("profiles").select("user_id, full_name, phone").ilike("full_name", f"%{query}%").execute()
-    user_ids_by_name = [p["user_id"] for p in res_profiles.data]
-    
-    all_user_ids = list(set(user_ids_by_tg + user_ids_by_name))
-    
+    q = str(query or "").strip()
+    if not q:
+        return []
+
+    user_ids: set[str] = set()
+
+    if q.isdigit():
+        u_resp = await rest_get(
+            "users",
+            {"select": "id", "telegram_id": f"eq.{q}", "limit": "200"},
+            write=True,
+        )
+        u_rows = u_resp.json()
+        if isinstance(u_rows, list):
+            for r in u_rows:
+                if isinstance(r, dict) and r.get("id"):
+                    user_ids.add(str(r["id"]))
+
+    u2_resp = await rest_get(
+        "users",
+        {"select": "id", "email": f"ilike.*{q}*", "limit": "200"},
+        write=True,
+    )
+    u2_rows = u2_resp.json()
+    if isinstance(u2_rows, list):
+        for r in u2_rows:
+            if isinstance(r, dict) and r.get("id"):
+                user_ids.add(str(r["id"]))
+
+    p_resp = await rest_get(
+        "profiles",
+        {"select": "user_id", "full_name": f"ilike.*{q}*", "limit": "500"},
+        write=True,
+    )
+    p_rows = p_resp.json()
+    if isinstance(p_rows, list):
+        for r in p_rows:
+            if isinstance(r, dict) and r.get("user_id"):
+                user_ids.add(str(r["user_id"]))
+
+    all_user_ids = list(user_ids)
     if not all_user_ids:
         return []
-        
-    final_res = supabase.table("users") \
-        .select("id, email, profiles(full_name, phone), user_roles(roles(code)), staff_locations(location_id, locations(name))") \
-        .in_("id", all_user_ids) \
-        .execute()
-        
+
+    final_resp = await rest_get(
+        "users",
+        {
+            "select": "id,email,profiles(full_name,phone),user_roles(roles(code)),staff_locations(location_id,locations(name))",
+            "id": _pg_in(all_user_ids[:1000]),
+            "limit": "1000",
+        },
+        write=True,
+    )
+    final_rows = final_resp.json()
+    if not isinstance(final_rows, list):
+        final_rows = []
+
     users = []
-    for u in final_res.data:
+    for u in final_rows:
         profile = u.get("profiles")
         if isinstance(profile, list):
             profile = profile[0] if profile else None
@@ -1284,31 +1569,43 @@ async def assign_roles(user_id: UUID, role_in: RoleAssign):
     if is_admin and is_secretary:
         raise HTTPException(status_code=400, detail="Администратор не может быть секретарем")
         
-    roles_res = supabase.table("roles").select("id, code").in_("code", role_in.role_codes).execute()
-    if not roles_res.data:
+    roles_resp = await rest_get(
+        "roles",
+        {"select": "id,code", "code": _pg_in([str(c) for c in role_in.role_codes]), "limit": "1000"},
+        write=True,
+    )
+    roles_rows = roles_resp.json()
+    if not isinstance(roles_rows, list) or not roles_rows:
         raise HTTPException(status_code=400, detail="Invalid role codes")
         
-    supabase.table("user_roles").delete().eq("user_id", user_id).execute()
-    to_insert_roles = [{"user_id": str(user_id), "role_id": r["id"]} for r in roles_res.data]
-    supabase.table("user_roles").insert(to_insert_roles).execute()
+    await rest_delete("user_roles", {"user_id": f"eq.{str(user_id)}"})
+    to_insert_roles = [{"user_id": str(user_id), "role_id": str(r["id"])} for r in roles_rows if r.get("id")]
+    if to_insert_roles:
+        await rest_post("user_roles", {}, to_insert_roles, prefer="return=minimal")
     
-    supabase.table("staff_locations").delete().eq("user_id", user_id).execute()
+    await rest_delete("staff_locations", {"user_id": f"eq.{str(user_id)}"})
     if role_in.location_id and (is_admin or is_secretary):
         to_insert_staff = [
             {"user_id": str(user_id), "location_id": str(role_in.location_id), "role_id": r["id"]} 
-            for r in roles_res.data
-            if ("admin" in r["code"] or "secretary" in r["code"])
+            for r in roles_rows
+            if ("admin" in str(r.get("code") or "") or "secretary" in str(r.get("code") or ""))
         ]
         if to_insert_staff:
-            supabase.table("staff_locations").insert(to_insert_staff).execute()
+            await rest_post("staff_locations", {}, to_insert_staff, prefer="return=minimal")
     
-    res = supabase.table("users") \
-        .select("id, email, profiles(full_name, phone), user_roles(roles(code)), staff_locations(location_id, locations(name))") \
-        .eq("id", user_id) \
-        .single() \
-        .execute()
-        
-    u = res.data
+    res = await rest_get(
+        "users",
+        {
+            "select": "id,email,profiles(full_name,phone),user_roles(roles(code)),staff_locations(location_id,locations(name))",
+            "id": f"eq.{str(user_id)}",
+            "limit": "1",
+        },
+        write=True,
+    )
+    u_rows = res.json()
+    u = u_rows[0] if isinstance(u_rows, list) and u_rows else None
+    if not isinstance(u, dict):
+        raise HTTPException(status_code=404, detail="User not found")
     profile = u.get("profiles")
     if isinstance(profile, list):
         profile = profile[0] if profile else None
@@ -1333,34 +1630,57 @@ async def assign_roles(user_id: UUID, role_in: RoleAssign):
 
 @router.get("/secretaries", response_model=List[UserProfile])
 async def get_secretaries(location_id: Optional[UUID] = None):
-    query = supabase.table("staff_locations") \
-        .select("user_id, roles!inner(code), location_id, locations(name), users!inner(email, profiles(full_name, phone))") \
-        .ilike("roles.code", "%secretary%")
-        
+    roles_resp = await rest_get(
+        "roles",
+        {"select": "id,code", "code": "ilike.*secretary*", "limit": "1000"},
+        write=True,
+    )
+    role_rows = roles_resp.json()
+    role_ids = [str(r["id"]) for r in role_rows if isinstance(r, dict) and r.get("id")]
+    if not role_ids:
+        return []
+
+    params: dict[str, str] = {
+        "select": "user_id,location_id,locations(name),roles(code),users(email,profiles(full_name,phone))",
+        "role_id": _pg_in(role_ids),
+        "limit": "10000",
+    }
     if location_id:
-        query = query.eq("location_id", location_id)
-        
-    res = query.execute()
-    
-    users_dict = {}
-    for r in res.data:
-        uid = r["user_id"]
+        params["location_id"] = f"eq.{str(location_id)}"
+
+    res = await rest_get("staff_locations", params, write=True)
+    rows = res.json()
+    if not isinstance(rows, list):
+        return []
+
+    users_dict: dict[str, dict] = {}
+    for r in rows:
+        if not isinstance(r, dict) or not r.get("user_id"):
+            continue
+        uid = str(r["user_id"])
         user = r.get("users") or {}
-        profile = user.get("profiles")
+        profile = user.get("profiles") if isinstance(user, dict) else None
         if isinstance(profile, list):
             profile = profile[0] if profile else None
+        roles = r.get("roles")
+        if isinstance(roles, list):
+            roles = roles[0] if roles else None
+        role_code = roles.get("code") if isinstance(roles, dict) else None
+
         if uid not in users_dict:
+            loc = r.get("locations") if isinstance(r.get("locations"), dict) else None
             users_dict[uid] = {
                 "user_id": uid,
-                "full_name": profile.get("full_name") if profile else None,
-                "phone": profile.get("phone") if profile else None,
-                "email": user.get("email"),
+                "full_name": profile.get("full_name") if isinstance(profile, dict) else None,
+                "phone": profile.get("phone") if isinstance(profile, dict) else None,
+                "email": user.get("email") if isinstance(user, dict) else None,
                 "location_id": r.get("location_id"),
-                "location_name": r["locations"]["name"] if r.get("locations") else None,
-                "roles": []
+                "location_name": loc.get("name") if loc else None,
+                "roles": [],
             }
-        users_dict[uid]["roles"].append(r["roles"]["code"])
-        
+        if role_code:
+            users_dict[uid]["roles"].append(str(role_code))
+
     return [UserProfile(**u) for u in users_dict.values()]
 
 
@@ -1378,7 +1698,7 @@ async def delete_user(user_id: UUID):
         # Also explicitly try to delete from public.users just in case cascade is missing
         # or if we want to be sure.
         # However, if cascade is ON, this second delete might find nothing, which is fine.
-        supabase.table("users").delete().eq("id", str(user_id)).execute()
+        await rest_delete("users", {"id": f"eq.{str(user_id)}"})
         
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1388,29 +1708,56 @@ async def delete_user(user_id: UUID):
 @router.get("/admins", response_model=List[UserProfile])
 async def get_admins():
     admin_codes = ["founder", "world_admin", "world_secretary", "country_admin", "country_secretary", "region_admin", "region_secretary"]
-    
-    res = supabase.table("staff_locations") \
-        .select("user_id, roles!inner(code), location_id, locations(name), users!inner(email, profiles(full_name, phone))") \
-        .in_("roles.code", admin_codes) \
-        .execute()
-        
-    users_dict = {}
-    for r in res.data:
-        uid = r["user_id"]
+
+    roles_resp = await rest_get(
+        "roles",
+        {"select": "id,code", "code": _pg_in([str(c) for c in admin_codes]), "limit": "1000"},
+        write=True,
+    )
+    role_rows = roles_resp.json()
+    role_ids = [str(r["id"]) for r in role_rows if isinstance(r, dict) and r.get("id")]
+    if not role_ids:
+        return []
+
+    res = await rest_get(
+        "staff_locations",
+        {
+            "select": "user_id,location_id,locations(name),roles(code),users(email,profiles(full_name,phone))",
+            "role_id": _pg_in(role_ids),
+            "limit": "10000",
+        },
+        write=True,
+    )
+    rows = res.json()
+    if not isinstance(rows, list):
+        return []
+
+    users_dict: dict[str, dict] = {}
+    for r in rows:
+        if not isinstance(r, dict) or not r.get("user_id"):
+            continue
+        uid = str(r["user_id"])
         user = r.get("users") or {}
-        profile = user.get("profiles")
+        profile = user.get("profiles") if isinstance(user, dict) else None
         if isinstance(profile, list):
             profile = profile[0] if profile else None
+        roles = r.get("roles")
+        if isinstance(roles, list):
+            roles = roles[0] if roles else None
+        role_code = roles.get("code") if isinstance(roles, dict) else None
+
         if uid not in users_dict:
+            loc = r.get("locations") if isinstance(r.get("locations"), dict) else None
             users_dict[uid] = {
                 "user_id": uid,
-                "full_name": profile.get("full_name") if profile else None,
-                "phone": profile.get("phone") if profile else None,
-                "email": user.get("email"),
+                "full_name": profile.get("full_name") if isinstance(profile, dict) else None,
+                "phone": profile.get("phone") if isinstance(profile, dict) else None,
+                "email": user.get("email") if isinstance(user, dict) else None,
                 "location_id": r.get("location_id"),
-                "location_name": r["locations"]["name"] if r.get("locations") else None,
-                "roles": []
+                "location_name": loc.get("name") if loc else None,
+                "roles": [],
             }
-        users_dict[uid]["roles"].append(r["roles"]["code"])
-        
+        if role_code:
+            users_dict[uid]["roles"].append(str(role_code))
+
     return [UserProfile(**u) for u in users_dict.values()]

@@ -18,7 +18,12 @@ def _headers(write: bool = False) -> Dict[str, str]:
 async def _get_client() -> httpx.AsyncClient:
     global _client
     if _client is None:
-        _client = httpx.AsyncClient(http2=False, timeout=20.0)
+        _client = httpx.AsyncClient(
+            http2=False,
+            timeout=httpx.Timeout(20.0, connect=8.0),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20, keepalive_expiry=10.0),
+            transport=httpx.AsyncHTTPTransport(retries=3),
+        )
     return _client
 
 async def rest_get(path: str, params: Dict[str, Any], *, write: bool = False) -> httpx.Response:

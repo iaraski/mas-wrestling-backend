@@ -3,7 +3,7 @@ from typing import List, Optional
 from uuid import UUID
 import random
 import math
-from app.core.supabase import supabase
+from app.core.rest import rest_get
 from app.schemas.competition import Bracket, Match
 
 router = APIRouter(prefix="/brackets", tags=["brackets"])
@@ -15,18 +15,23 @@ async def get_bracket(category_id: UUID):
     
     # Сначала получим всех одобренных атлетов в этой категории
     try:
-        apps = supabase.table("applications") \
-            .select("athlete_id, athletes(users!athletes_user_id_fkey(profiles(full_name)))") \
-            .eq("category_id", category_id) \
-            .eq("status", "approved") \
-            .execute()
-            
-        if not apps.data:
+        resp = await rest_get(
+            "applications",
+            {
+                "select": "athlete_id,athletes(users!athletes_user_id_fkey(profiles(full_name)))",
+                "category_id": f"eq.{str(category_id)}",
+                "status": "eq.approved",
+                "limit": "10000",
+            },
+            write=True,
+        )
+        rows = resp.json()
+        if not isinstance(rows, list) or not rows:
              # Return empty bracket structure instead of 404 to avoid frontend crash if no participants yet
              return Bracket(category_id=category_id, type="pending", matches=[])
 
         athletes = []
-        for app in apps.data:
+        for app in rows:
             full_name = "Unknown"
             try:
                 if (app.get("athletes") and 

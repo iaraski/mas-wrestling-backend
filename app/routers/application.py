@@ -8,6 +8,8 @@ from datetime import datetime, timezone, timedelta
 from uuid import UUID, uuid4
 import anyio
 from app.core.supabase import supabase, admin_supabase
+from app.core.rest import rest_get, rest_post, rest_upsert, rest_patch, rest_delete
+from app.core.supabase import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 from app.schemas.competition import Application, ApplicationCreate, ApplicationUpdate
 
 from app.core.telegram import send_telegram_notification, get_telegram_file_url
@@ -61,14 +63,18 @@ def _format_category_label(cat: dict, at_date: str | None) -> str:
         return "Неизвестная категория"
 
 async def _get_role_codes(user_id: str) -> list[str]:
-    if not admin_supabase:
-        return []
     try:
-        res = admin_supabase.table("user_roles").select("roles(code)").eq("user_id", user_id).execute()
-        data = res.data or []
+        res = await rest_get(
+            "user_roles",
+            {"select": "roles(code)", "user_id": f"eq.{user_id}", "limit": "1000"},
+            write=True,
+        )
+        data = res.json() or []
         out: list[str] = []
+        if not isinstance(data, list):
+            return []
         for r in data:
-            role = r.get("roles")
+            role = r.get("roles") if isinstance(r, dict) else None
             if isinstance(role, list):
                 role = role[0] if role else None
             code = role.get("code") if isinstance(role, dict) else None
@@ -106,10 +112,13 @@ class AdminCreateAthleteApplication(BaseModel):
 
 class AdminUpdateAthleteProfile(BaseModel):
     full_name: str
+    phone: Optional[str] = None
+    email: Optional[str] = None
     city: str
     location_id: UUID
     coach_name: str
     birth_date: str
+    gender: Optional[str] = None
     rank: str
     photo_url: str
 
@@ -165,18 +174,21 @@ async def _get_user_id_from_bearer(authorization: str | None) -> str:
 @router.get("/", response_model=List[Application])
 async def get_applications(competition_id: Optional[UUID] = None):
     try:
-        # Запрашиваем заявки с данными спортсмена (ФИО из профиля через athletes -> users -> profiles) и данными категории
-        # Используем явное имя отношения (FK), так как Supabase нашел несколько связей
-        query = supabase.table("applications").select(
-            "*, competition:competitions(start_date), athletes(users!athletes_user_id_fkey(profiles(full_name))), competition_categories(*)"
-        )
+        params = {
+            "select": "*,competition:competitions(start_date),athletes(users!athletes_user_id_fkey(profiles(full_name))),competition_categories(*)",
+            "order": "created_at.desc",
+            "limit": "10000",
+        }
         if competition_id:
-            query = query.eq("competition_id", competition_id)
-        response = query.execute()
+            params["competition_id"] = f"eq.{str(competition_id)}"
+        response = await rest_get("applications", params, write=True)
+        rows = response.json()
+        if not isinstance(rows, list):
+            rows = []
         
         # Преобразуем данные, чтобы вынести ФИО и описание категории
         apps = []
-        for app in response.data:
+        for app in rows:
             full_name = "Unknown"
             try:
                 # athlete -> users -> profiles -> full_name
@@ -246,34 +258,42 @@ async def get_photo_proxy(file_id: str):
 @router.get("/{app_id}")
 async def get_application_details(app_id: UUID, authorization: str | None = Header(default=None)):
     try:
-        client = supabase
-        if authorization and admin_supabase:
+        write = False
+        if authorization:
             try:
                 requester_id = await _get_user_id_from_bearer(authorization)
                 codes = await _get_role_codes(requester_id)
-                if _is_staff(codes):
-                    client = admin_supabase
+                write = _is_staff(codes)
             except Exception:
-                client = supabase
+                write = False
 
         # Получаем детальную информацию по заявке, включая паспорт
-        query = client.table("applications").select(
-            "*, "
-            "athletes(coach_name, user_id, users!athletes_user_id_fkey(email, profiles(full_name, phone, city, location_id))), "
-            "competition_categories(*)"
-        ).eq("id", app_id).single().execute()
-        
-        if not query.data:
+        resp = await rest_get(
+            "applications",
+            {
+                "select": "*,athletes(coach_name,user_id,users!athletes_user_id_fkey(email,profiles(full_name,phone,city,location_id))),competition_categories(*),competition:competitions(start_date,name)",
+                "id": f"eq.{str(app_id)}",
+                "limit": "1",
+            },
+            write=write,
+        )
+        rows = resp.json()
+        if not isinstance(rows, list) or not rows:
             raise HTTPException(status_code=404, detail="Application not found")
             
-        app_data = query.data
+        app_data = rows[0]
         
         # Получаем паспорт отдельно, так как он привязан к athlete_id
         athlete_id = app_data.get("athlete_id")
         passport_data = None
         if athlete_id:
-            pass_query = client.table("passports").select("*").eq("athlete_id", athlete_id).maybe_single().execute()
-            passport_data = pass_query.data
+            pass_resp = await rest_get(
+                "passports",
+                {"select": "*", "athlete_id": f"eq.{str(athlete_id)}", "limit": "1"},
+                write=write,
+            )
+            pass_rows = pass_resp.json()
+            passport_data = pass_rows[0] if isinstance(pass_rows, list) and pass_rows else None
             
             # Если есть фото, возвращаем URL на наш собственный прокси-эндпоинт
             if passport_data and passport_data.get("photo_url"):
@@ -354,10 +374,16 @@ class PassportVerifyUpdate(BaseModel):
 @router.patch("/passport/{passport_id}/verify")
 async def verify_passport(passport_id: UUID, payload: PassportVerifyUpdate):
     try:
-        res = supabase.table("passports").update({"is_verified": payload.is_verified}).eq("id", passport_id).execute()
-        if not res.data:
+        res = await rest_patch(
+            "passports",
+            {"id": f"eq.{str(passport_id)}"},
+            {"is_verified": bool(payload.is_verified)},
+            prefer="return=representation",
+        )
+        rows = res.json()
+        if not isinstance(rows, list) or not rows:
             raise HTTPException(status_code=404, detail="Passport not found")
-        return res.data[0]
+        return rows[0]
     except Exception as e:
         import traceback
         print(f"[Applications] Error verifying passport: {e}")
@@ -369,19 +395,30 @@ async def create_application(app_in: ApplicationCreate):
     # В реальном проекте здесь будет проверка на то, что это атлет или тренер за атлета
     
     # Проверка, нет ли уже заявки от этого атлета на это соревнование
-    check = supabase.table("applications") \
-        .select("id") \
-        .eq("athlete_id", app_in.athlete_id) \
-        .eq("competition_id", app_in.competition_id) \
-        .execute()
-        
-    if check.data:
+    check_resp = await rest_get(
+        "applications",
+        {
+            "select": "id",
+            "athlete_id": f"eq.{str(app_in.athlete_id)}",
+            "competition_id": f"eq.{str(app_in.competition_id)}",
+            "limit": "1",
+        },
+        write=True,
+    )
+    check_rows = check_resp.json()
+    if isinstance(check_rows, list) and check_rows:
         raise HTTPException(status_code=400, detail="Application already exists")
         
-    res = supabase.table("applications").insert(app_in.model_dump()).execute()
-    if not res.data:
+    res = await rest_post(
+        "applications",
+        {},
+        app_in.model_dump(),
+        prefer="return=representation",
+    )
+    rows = res.json()
+    if not isinstance(rows, list) or not rows:
         raise HTTPException(status_code=400, detail="Failed to create application")
-    return res.data[0]
+    return rows[0]
 
 @router.post("/me")
 async def create_my_application(
@@ -404,24 +441,46 @@ async def create_my_application(
     if not _applications_open_now():
         raise HTTPException(status_code=403, detail="Application deadline has passed")
 
-    cat_res = admin_supabase.table("competition_categories").select("competition_id").eq("id", category_id).maybe_single().execute()
-    if not cat_res.data or not cat_res.data.get("competition_id"):
+    cat_resp = await rest_get(
+        "competition_categories",
+        {"select": "competition_id", "id": f"eq.{category_id}", "limit": "1"},
+        write=True,
+    )
+    cat_rows = cat_resp.json()
+    if not isinstance(cat_rows, list) or not cat_rows or not cat_rows[0].get("competition_id"):
         raise HTTPException(status_code=404, detail="Category not found")
-    competition_id = str(cat_res.data["competition_id"])
+    competition_id = str(cat_rows[0]["competition_id"])
 
-    athlete_res = admin_supabase.table("athletes").select("id").eq("user_id", user_id).maybe_single().execute()
-    if not athlete_res.data:
+    athlete_resp = await rest_get(
+        "athletes",
+        {"select": "id,coach_name", "user_id": f"eq.{user_id}", "limit": "1"},
+        write=True,
+    )
+    athlete_rows = athlete_resp.json()
+    if not isinstance(athlete_rows, list) or not athlete_rows or not athlete_rows[0].get("id"):
         raise HTTPException(status_code=404, detail="Athlete not found")
-        
-    athlete_id = athlete_res.data["id"]
+    athlete_id = str(athlete_rows[0]["id"])
+    coach = athlete_rows[0] if isinstance(athlete_rows[0], dict) else {}
 
-    prof_res = admin_supabase.table("profiles").select("full_name,city,location_id").eq("user_id", user_id).maybe_single().execute()
-    prof = prof_res.data or {}
-    pass_res = admin_supabase.table("passports").select("birth_date,rank,photo_url,gender").eq("athlete_id", str(athlete_id)).maybe_single().execute()
-    passport = pass_res.data or {}
+    prof_resp = await rest_get(
+        "profiles",
+        {"select": "full_name,city,location_id", "user_id": f"eq.{user_id}", "limit": "1"},
+        write=True,
+    )
+    prof_rows = prof_resp.json()
+    prof = prof_rows[0] if isinstance(prof_rows, list) and prof_rows else {}
 
-    coach_res = admin_supabase.table("athletes").select("coach_name").eq("id", str(athlete_id)).maybe_single().execute()
-    coach = coach_res.data or {}
+    pass_resp = await rest_get(
+        "passports",
+        {
+            "select": "birth_date,rank,photo_url,gender",
+            "athlete_id": f"eq.{athlete_id}",
+            "limit": "1",
+        },
+        write=True,
+    )
+    pass_rows = pass_resp.json()
+    passport = pass_rows[0] if isinstance(pass_rows, list) and pass_rows else {}
 
     if not prof.get("full_name") or not prof.get("city") or not prof.get("location_id"):
         raise HTTPException(status_code=400, detail="Fill full_name, city and region")
@@ -431,32 +490,45 @@ async def create_my_application(
         raise HTTPException(status_code=400, detail="Fill birth_date, gender, rank and upload photo")
     
     # Check if already applied to this competition (only one application per competition)
-    existing = (
-        admin_supabase.table("applications")
-        .select("id")
-        .eq("athlete_id", athlete_id)
-        .eq("competition_id", competition_id)
-        .execute()
+    existing_resp = await rest_get(
+        "applications",
+        {
+            "select": "id",
+            "athlete_id": f"eq.{athlete_id}",
+            "competition_id": f"eq.{competition_id}",
+            "limit": "1",
+        },
+        write=True,
     )
-    if existing.data:
+    existing_rows = existing_resp.json()
+    if isinstance(existing_rows, list) and existing_rows:
         raise HTTPException(status_code=400, detail="Already applied to this competition")
         
-    res = admin_supabase.table("applications").insert({
+    res = await rest_post(
+        "applications",
+        {},
+        {
         "competition_id": competition_id,
         "athlete_id": athlete_id,
         "category_id": category_id,
         "status": "pending"
-    }).execute()
+        },
+        prefer="return=representation",
+    )
+    created_rows = res.json()
+    if not isinstance(created_rows, list) or not created_rows:
+        raise HTTPException(status_code=400, detail="Failed to create application")
 
     try:
-        admin_supabase.table("registrations").upsert(
+        await rest_upsert(
+            "registrations",
             {"user_id": user_id, "stage": "complete", "consent_accepted": True},
             on_conflict="user_id",
-        ).execute()
+        )
     except Exception:
         pass
 
-    return res.data[0]
+    return created_rows[0]
 
 
 @router.post("/admin-create")
@@ -472,25 +544,40 @@ async def admin_create_athlete_and_application(
         raise HTTPException(status_code=403, detail="Forbidden")
 
     cat_id = str(body.category_id)
-    cat_res = admin_supabase.table("competition_categories").select("competition_id").eq("id", cat_id).maybe_single().execute()
-    if not cat_res.data or not cat_res.data.get("competition_id"):
+    cat_resp = await rest_get(
+        "competition_categories",
+        {"select": "competition_id", "id": f"eq.{cat_id}", "limit": "1"},
+        write=True,
+    )
+    cat_rows = cat_resp.json()
+    if not isinstance(cat_rows, list) or not cat_rows or not cat_rows[0].get("competition_id"):
         raise HTTPException(status_code=404, detail="Category not found")
-    competition_id = str(cat_res.data["competition_id"])
+    competition_id = str(cat_rows[0]["competition_id"])
 
     user_id = str(uuid4())
-    admin_supabase.table("users").insert({"id": user_id}).execute()
-    admin_supabase.table("profiles").insert(
-        {"user_id": user_id, "full_name": body.full_name, "city": body.city, "location_id": str(body.location_id)}
-    ).execute()
-    athlete_res = admin_supabase.table("athletes").insert({"user_id": user_id, "coach_name": body.coach_name}).execute()
-    if not athlete_res.data:
+    await rest_post("users", {}, {"id": user_id}, prefer="return=minimal")
+    await rest_post(
+        "profiles",
+        {},
+        {"user_id": user_id, "full_name": body.full_name, "city": body.city, "location_id": str(body.location_id)},
+        prefer="return=minimal",
+    )
+    athlete_insert = await rest_post(
+        "athletes",
+        {},
+        {"user_id": user_id, "coach_name": body.coach_name},
+        prefer="return=representation",
+    )
+    athlete_rows = athlete_insert.json()
+    if not isinstance(athlete_rows, list) or not athlete_rows or not athlete_rows[0].get("id"):
         raise HTTPException(status_code=400, detail="Failed to create athlete")
-    athlete_id = str(athlete_res.data[0]["id"])
+    athlete_id = str(athlete_rows[0]["id"])
 
-    admin_supabase.table("passports").upsert(
+    await rest_upsert(
+        "passports",
         {"athlete_id": athlete_id, "birth_date": body.birth_date, "rank": body.rank, "photo_url": body.photo_url},
         on_conflict="athlete_id",
-    ).execute()
+    )
 
     status = "weighed" if body.actual_weight is not None else "approved"
     app_payload = {
@@ -501,10 +588,11 @@ async def admin_create_athlete_and_application(
         "declared_weight": body.declared_weight,
         "actual_weight": body.actual_weight,
     }
-    app_res = admin_supabase.table("applications").insert(app_payload).execute()
-    if not app_res.data:
+    app_insert = await rest_post("applications", {}, app_payload, prefer="return=representation")
+    app_rows = app_insert.json()
+    if not isinstance(app_rows, list) or not app_rows:
         raise HTTPException(status_code=400, detail="Failed to create application")
-    return {"ok": True, "user_id": user_id, "athlete_id": athlete_id, "application": app_res.data[0]}
+    return {"ok": True, "user_id": user_id, "athlete_id": athlete_id, "application": app_rows[0]}
 
 
 @router.post("/admin-apply")
@@ -520,19 +608,32 @@ async def admin_apply_athlete_to_category(
         raise HTTPException(status_code=403, detail="Forbidden")
 
     cat_id = str(body.category_id)
-    cat_res = admin_supabase.table("competition_categories").select(
-        "id,competition_id,gender,age_min,age_max"
-    ).eq("id", cat_id).maybe_single().execute()
-    if not cat_res.data:
+    cat_resp = await rest_get(
+        "competition_categories",
+        {"select": "id,competition_id,gender,age_min,age_max", "id": f"eq.{cat_id}", "limit": "1"},
+        write=True,
+    )
+    cat_rows = cat_resp.json()
+    if not isinstance(cat_rows, list) or not cat_rows:
         raise HTTPException(status_code=404, detail="Category not found")
-    category = cat_res.data
+    category = cat_rows[0]
     competition_id = str(category["competition_id"])
 
-    comp_res = admin_supabase.table("competitions").select("start_date").eq("id", competition_id).maybe_single().execute()
-    start_date_str = comp_res.data.get("start_date") if comp_res.data else None
+    comp_resp = await rest_get(
+        "competitions",
+        {"select": "start_date", "id": f"eq.{competition_id}", "limit": "1"},
+        write=True,
+    )
+    comp_rows = comp_resp.json()
+    start_date_str = comp_rows[0].get("start_date") if isinstance(comp_rows, list) and comp_rows else None
 
-    pass_res = admin_supabase.table("passports").select("birth_date,gender,photo_url").eq("athlete_id", str(body.athlete_id)).maybe_single().execute()
-    passport = pass_res.data or {}
+    pass_resp = await rest_get(
+        "passports",
+        {"select": "birth_date,gender,photo_url", "athlete_id": f"eq.{str(body.athlete_id)}", "limit": "1"},
+        write=True,
+    )
+    pass_rows = pass_resp.json()
+    passport = pass_rows[0] if isinstance(pass_rows, list) and pass_rows else {}
     if not passport.get("birth_date") or not passport.get("gender"):
         raise HTTPException(status_code=400, detail="Athlete birth_date and gender are required")
 
@@ -556,47 +657,55 @@ async def admin_apply_athlete_to_category(
     if age < int(category.get("age_min") or 0) or age > int(category.get("age_max") or 200):
         raise HTTPException(status_code=400, detail="Athlete age does not match category")
 
-    existing_app = (
-        admin_supabase.table("applications")
-        .select("id,status,category_id")
-        .eq("athlete_id", str(body.athlete_id))
-        .eq("competition_id", competition_id)
-        .maybe_single()
-        .execute()
+    existing_resp = await rest_get(
+        "applications",
+        {
+            "select": "id,status,category_id",
+            "athlete_id": f"eq.{str(body.athlete_id)}",
+            "competition_id": f"eq.{competition_id}",
+            "limit": "1",
+        },
+        write=True,
     )
-    if existing_app.data:
-        existing_id = str(existing_app.data.get("id"))
-        existing_status = str(existing_app.data.get("status") or "")
+    existing_rows = existing_resp.json()
+    existing = existing_rows[0] if isinstance(existing_rows, list) and existing_rows else None
+    if existing:
+        existing_id = str(existing.get("id"))
+        existing_status = str(existing.get("status") or "")
         if existing_status != "rejected":
             raise HTTPException(
                 status_code=400,
                 detail=f"Athlete already has an application for this competition (status: {existing_status})",
             )
-        del_res = admin_supabase.table("applications").delete().eq("id", existing_id).execute()
-        if del_res.data is None:
+        del_res = await rest_delete("applications", {"id": f"eq.{existing_id}"})
+        if del_res.status_code not in (200, 204):
             raise HTTPException(status_code=400, detail="Failed to delete rejected application")
 
     try:
-        app_res = admin_supabase.table("applications").insert(
+        app_res = await rest_post(
+            "applications",
+            {},
             {
                 "competition_id": competition_id,
                 "athlete_id": str(body.athlete_id),
                 "category_id": cat_id,
                 "status": "approved",
-            }
-        ).execute()
+            },
+            prefer="return=representation",
+        )
     except Exception as e:
         code = getattr(e, "code", None)
         msg = str(e)
         if code == "23505" or "23505" in msg or "duplicate key value" in msg:
             raise HTTPException(status_code=400, detail="Athlete already has an application for this competition")
         raise
-    if not app_res.data:
+    app_rows = app_res.json()
+    if not isinstance(app_rows, list) or not app_rows:
         raise HTTPException(status_code=400, detail="Failed to create application")
     return {
         "ok": True,
-        "application": app_res.data[0],
-        "replaced": bool(existing_app.data),
+        "application": app_rows[0],
+        "replaced": bool(existing),
     }
 
 @router.put("/{app_id}/athlete-profile")
@@ -612,30 +721,64 @@ async def admin_update_athlete_profile(
     if not _is_staff(codes):
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    app_res = admin_supabase.table("applications").select("athlete_id").eq("id", str(app_id)).maybe_single().execute()
-    if not app_res.data or not app_res.data.get("athlete_id"):
+    app_resp = await rest_get(
+        "applications",
+        {"select": "athlete_id", "id": f"eq.{str(app_id)}", "limit": "1"},
+        write=True,
+    )
+    app_rows = app_resp.json()
+    if not isinstance(app_rows, list) or not app_rows or not app_rows[0].get("athlete_id"):
         raise HTTPException(status_code=404, detail="Application not found")
-    athlete_id = str(app_res.data["athlete_id"])
+    athlete_id = str(app_rows[0]["athlete_id"])
 
-    ath_res = admin_supabase.table("athletes").select("user_id").eq("id", athlete_id).maybe_single().execute()
-    if not ath_res.data or not ath_res.data.get("user_id"):
+    ath_resp = await rest_get(
+        "athletes",
+        {"select": "user_id", "id": f"eq.{athlete_id}", "limit": "1"},
+        write=True,
+    )
+    ath_rows = ath_resp.json()
+    if not isinstance(ath_rows, list) or not ath_rows or not ath_rows[0].get("user_id"):
         raise HTTPException(status_code=404, detail="Athlete not found")
-    user_id = str(ath_res.data["user_id"])
+    user_id = str(ath_rows[0]["user_id"])
 
-    admin_supabase.table("profiles").upsert(
+    email = str(body.email or "").strip().lower() if body.email is not None else None
+    if email:
+        await rest_patch("users", {"id": f"eq.{user_id}"}, {"email": email}, prefer="return=minimal")
+        if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=8.0)) as client:
+                upd = await client.patch(
+                    f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+                    json={"email": email, "email_confirm": True},
+                    headers={
+                        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                        "Content-Type": "application/json",
+                    },
+                )
+                if upd.status_code not in (200, 201):
+                    raise HTTPException(status_code=400, detail=f"Failed to update auth email: {upd.text}")
+
+    prof_payload: dict[str, object] = {
+        "user_id": user_id,
+        "full_name": body.full_name,
+        "city": body.city,
+        "location_id": str(body.location_id),
+    }
+    if body.phone is not None:
+        prof_payload["phone"] = str(body.phone).strip() or None
+    await rest_upsert("profiles", prof_payload, on_conflict="user_id")
+    await rest_patch("athletes", {"id": f"eq.{athlete_id}"}, {"coach_name": body.coach_name}, prefer="return=minimal")
+    await rest_upsert(
+        "passports",
         {
-            "user_id": user_id,
-            "full_name": body.full_name,
-            "city": body.city,
-            "location_id": str(body.location_id),
+            "athlete_id": athlete_id,
+            "birth_date": body.birth_date,
+            "gender": body.gender,
+            "rank": body.rank,
+            "photo_url": body.photo_url,
         },
-        on_conflict="user_id",
-    ).execute()
-    admin_supabase.table("athletes").update({"coach_name": body.coach_name}).eq("id", athlete_id).execute()
-    admin_supabase.table("passports").upsert(
-        {"athlete_id": athlete_id, "birth_date": body.birth_date, "rank": body.rank, "photo_url": body.photo_url},
         on_conflict="athlete_id",
-    ).execute()
+    )
 
     return {"ok": True}
 
@@ -646,20 +789,20 @@ async def update_application_status(app_id: UUID, app_update: ApplicationUpdate)
     
     # Сначала получим текущую заявку, чтобы знать telegram_id и название соревнования
     # Используем явное имя отношения для athletes -> users
-    try:
-        query = supabase.table("applications") \
-            .select("*, competition:competitions(name), athletes(users!athletes_user_id_fkey(telegram_id))") \
-            .eq("id", app_id) \
-            .single() \
-            .execute()
-    except Exception as e:
-        print(f"[Applications] Error fetching app for update: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-        
-    if not query.data:
+    resp = await rest_get(
+        "applications",
+        {
+            "select": "*,competition:competitions(name,start_date),athletes(users!athletes_user_id_fkey(telegram_id)),competition_categories(*)",
+            "id": f"eq.{str(app_id)}",
+            "limit": "1",
+        },
+        write=True,
+    )
+    rows = resp.json()
+    if not isinstance(rows, list) or not rows:
         raise HTTPException(status_code=404, detail="Application not found")
         
-    old_app = query.data
+    old_app = rows[0]
     
     # Обновляем статус
     update_data = app_update.model_dump(exclude_unset=True)
@@ -671,15 +814,17 @@ async def update_application_status(app_id: UUID, app_update: ApplicationUpdate)
         if isinstance(value, UUID):
             update_data[key] = str(value)
             
-    res = supabase.table("applications") \
-        .update(update_data) \
-        .eq("id", app_id) \
-        .execute()
-        
-    if not res.data:
+    upd = await rest_patch(
+        "applications",
+        {"id": f"eq.{str(app_id)}"},
+        update_data,
+        prefer="return=representation",
+    )
+    upd_rows = upd.json()
+    if not isinstance(upd_rows, list) or not upd_rows:
         raise HTTPException(status_code=404, detail="Application not found")
         
-    updated_app = res.data[0]
+    updated_app = upd_rows[0]
     
     # Если статус изменился, отправляем уведомление
     if "status" in update_data and updated_app["status"] != old_app["status"]:
@@ -725,9 +870,14 @@ async def update_application_status(app_id: UUID, app_update: ApplicationUpdate)
                 
                 if cat_id:
                     try:
-                        cat_res = supabase.table("competition_categories").select("*").eq("id", cat_id).single().execute()
-                        if cat_res.data:
-                            cat = cat_res.data
+                        cat_resp = await rest_get(
+                            "competition_categories",
+                            {"select": "*", "id": f"eq.{str(cat_id)}", "limit": "1"},
+                            write=True,
+                        )
+                        cat_rows = cat_resp.json()
+                        if isinstance(cat_rows, list) and cat_rows:
+                            cat = cat_rows[0]
                             gender = "М" if cat.get("gender") == "male" else "Ж"
                             
                             if cat.get('weight_max') == 999:

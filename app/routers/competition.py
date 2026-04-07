@@ -7,7 +7,7 @@ import os
 import httpx
 import anyio
 from app.core.supabase import supabase, admin_supabase, SUPABASE_URL, SUPABASE_KEY, SUPABASE_SERVICE_ROLE_KEY
-from app.core.rest import rest_get
+from app.core.rest import rest_get, rest_delete, rest_post, rest_patch
 from app.schemas.competition import Competition, CompetitionCreate, CompetitionUpdate
 from app.core.cache import cache
 
@@ -64,13 +64,14 @@ async def get_active_competitions():
             return cached
 
         params = {
-            "select": "*,categories:competition_categories(*)",
+            "select": "id,name,scale,type,location_id,mandate_start_date,mandate_end_date,start_date,end_date,preview_url,description,mats_count,categories:competition_categories(id,competition_id,gender,age_min,age_max,weight_min,weight_max,competition_day,mandate_day)",
             "end_date": f"gte.{datetime.now().isoformat()}",
             "order": "start_date.asc",
+            "limit": "50",
         }
         resp = await rest_get("competitions", params, write=False)
         data = resp.json()
-        cache.set(cache_key, data, ttl_seconds=15.0)
+        cache.set(cache_key, data, ttl_seconds=60.0)
         return data
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Supabase unavailable: {repr(e)}")
@@ -118,15 +119,15 @@ async def create_competition(comp: CompetitionCreate):
             comp_data["location_id"] = str(comp_data["location_id"])
 
         print(f"[Backend] Creating competition: {comp_data['name']}")
-        
-        res = supabase.table("competitions").insert(comp_data).execute()
-        
-        print(f"[Backend] Competition insert response: {res.data}")
-        
-        if not res.data:
+
+        res = await rest_post("competitions", {}, comp_data, prefer="return=representation")
+        rows = res.json()
+        print(f"[Backend] Competition insert response: {rows}")
+
+        if not isinstance(rows, list) or not rows:
             raise HTTPException(status_code=400, detail="Supabase insert failed: no data returned")
-        
-        new_comp = res.data[0]
+
+        new_comp = rows[0]
         print(f"[Backend] Competition created with ID: {new_comp['id']}")
         
         # 2. Создаем категории
@@ -143,8 +144,9 @@ async def create_competition(comp: CompetitionCreate):
                 categories_data.append(cat_dict)
 
             print(f"[Backend] Inserting {len(categories_data)} categories")
-            cat_res = supabase.table("competition_categories").insert(categories_data).execute()
-            final_categories = cat_res.data
+            cat_res = await rest_post("competition_categories", {}, categories_data, prefer="return=representation")
+            cat_rows = cat_res.json()
+            final_categories = cat_rows if isinstance(cat_rows, list) else []
             print(f"[Backend] Categories created: {len(final_categories)}")
             
         # 3. Добавляем секретарей
@@ -153,7 +155,7 @@ async def create_competition(comp: CompetitionCreate):
                 {"competition_id": new_comp["id"], "user_id": str(sec_id)}
                 for sec_id in comp.secretaries
             ]
-            supabase.table("competition_secretaries").insert(secretaries_data).execute()
+            await rest_post("competition_secretaries", {}, secretaries_data, prefer="return=minimal")
             
         cache.invalidate_prefix("competitions:")
         return {**new_comp, "categories": final_categories}
@@ -169,13 +171,17 @@ async def get_competition(comp_id: UUID):
         if cached is not None:
             return cached
 
-        q = supabase.table("competitions").select("*, categories:competition_categories(*)").eq("id", str(comp_id)).single()
-        response = await _execute(q)
+        resp = await rest_get(
+            "competitions",
+            {"select": "*,categories:competition_categories(*)", "id": f"eq.{str(comp_id)}", "limit": "1"},
+            write=False,
+        )
+        rows = resp.json()
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Supabase unavailable: {repr(e)}")
-    if not response.data:
+    if not isinstance(rows, list) or not rows:
         raise HTTPException(status_code=404, detail="Competition not found")
-    data = response.data
+    data = rows[0]
     cache.set(cache_key, data, ttl_seconds=15.0)
     return data
 
@@ -199,30 +205,61 @@ async def update_competition(comp_id: UUID, comp_update: CompetitionUpdate):
             elif isinstance(value, datetime):
                 update_data[key] = value.isoformat()
 
-        if update_data:
-            res = supabase.table("competitions").update(update_data).eq("id", comp_id_str).execute()
-            if not res.data:
-                raise HTTPException(status_code=404, detail="Competition not found")
+        if categories_data is None:
+            if update_data:
+                resp = await rest_patch(
+                    "competitions",
+                    {"id": f"eq.{comp_id_str}"},
+                    update_data,
+                    prefer="return=minimal",
+                )
+                if resp.status_code not in (200, 204):
+                    raise HTTPException(status_code=400, detail=f"Failed to update competition: {resp.text}")
+
+            if secretaries_data is not None:
+                del_resp = await rest_delete(
+                    "competition_secretaries",
+                    {"competition_id": f"eq.{comp_id_str}"},
+                )
+                if del_resp.status_code not in (200, 204):
+                    raise HTTPException(status_code=400, detail=f"Failed to clear secretaries: {del_resp.text}")
+                if secretaries_data:
+                    secs_to_insert = [
+                        {"competition_id": comp_id_str, "user_id": str(sec_id)}
+                        for sec_id in secretaries_data
+                    ]
+                    ins = await rest_post("competition_secretaries", {}, secs_to_insert, prefer="return=minimal")
+                    if ins.status_code not in (200, 201, 204):
+                        raise HTTPException(status_code=400, detail=f"Failed to insert secretaries: {ins.text}")
+
+            cache.invalidate_prefix("competitions:")
+            detail = await get_competition(comp_id)
+            return detail
         
         # Обновление категорий
         if categories_data is not None:
             # Получаем старые категории и используемые в заявках
-            existing_res = (
-                supabase.table("competition_categories")
-                .select("id,gender,age_min,age_max,weight_min,weight_max,competition_day,mandate_day")
-                .eq("competition_id", comp_id_str)
-                .execute()
+            existing_resp = await rest_get(
+                "competition_categories",
+                {
+                    "select": "id,gender,age_min,age_max,weight_min,weight_max,competition_day,mandate_day",
+                    "competition_id": f"eq.{comp_id_str}",
+                    "limit": "10000",
+                },
+                write=True,
             )
-            existing_cats = existing_res.data or []
+            existing_cats = existing_resp.json()
+            if not isinstance(existing_cats, list):
+                existing_cats = []
             old_cat_ids = {str(cat["id"]) for cat in existing_cats}
 
-            apps_res = (
-                supabase.table("applications")
-                .select("category_id")
-                .eq("competition_id", comp_id_str)
-                .execute()
+            apps_resp = await rest_get(
+                "applications",
+                {"select": "category_id", "competition_id": f"eq.{comp_id_str}", "limit": "10000"},
+                write=True,
             )
-            used_cat_ids = {str(a["category_id"]) for a in (apps_res.data or []) if a.get("category_id")}
+            apps_rows = apps_resp.json()
+            used_cat_ids = {str(a["category_id"]) for a in (apps_rows or []) if isinstance(a, dict) and a.get("category_id")} if isinstance(apps_rows, list) else set()
 
             existing_by_key: dict[tuple, list[dict]] = {}
             for c in existing_cats:
@@ -245,7 +282,12 @@ async def update_competition(comp_id: UUID, comp_update: CompetitionUpdate):
                         cat_id = str(cat_dict.pop("id"))
                         if cat_id in old_cat_ids:
                             old_cat_ids.remove(cat_id)
-                        supabase.table("competition_categories").update(cat_dict).eq("id", cat_id).execute()
+                        await rest_patch(
+                            "competition_categories",
+                            {"id": f"eq.{cat_id}"},
+                            cat_dict,
+                            prefer="return=minimal",
+                        )
                     else:
                         # Пытаемся сопоставить по полям, чтобы не плодить дубликаты
                         if "id" in cat_dict:
@@ -262,28 +304,39 @@ async def update_competition(comp_id: UUID, comp_update: CompetitionUpdate):
                             chosen_id = str(chosen["id"])
                             if chosen_id in old_cat_ids:
                                 old_cat_ids.remove(chosen_id)
-                            supabase.table("competition_categories").update(cat_dict).eq("id", chosen_id).execute()
+                            await rest_patch(
+                                "competition_categories",
+                                {"id": f"eq.{chosen_id}"},
+                                cat_dict,
+                                prefer="return=minimal",
+                            )
                         else:
-                            supabase.table("competition_categories").insert(cat_dict).execute()
+                            await rest_post("competition_categories", {}, cat_dict, prefer="return=minimal")
                         
             # Удаляем те, которых больше нет (если на них нет ссылок в заявках)
             for cat_id in old_cat_ids:
                 if cat_id in used_cat_ids:
                     continue
                 try:
-                    supabase.table("competition_categories").delete().eq("id", cat_id).execute()
+                    await rest_delete("competition_categories", {"id": f"eq.{cat_id}"})
                 except Exception as e:
                     print(f"Cannot delete category {cat_id}, likely has applications: {e}")
 
             # Чистим точные дубликаты (удаляем только неиспользуемые)
-            refreshed = (
-                supabase.table("competition_categories")
-                .select("id,gender,age_min,age_max,weight_min,weight_max,competition_day,mandate_day")
-                .eq("competition_id", comp_id_str)
-                .execute()
+            refreshed = await rest_get(
+                "competition_categories",
+                {
+                    "select": "id,gender,age_min,age_max,weight_min,weight_max,competition_day,mandate_day",
+                    "competition_id": f"eq.{comp_id_str}",
+                    "limit": "10000",
+                },
+                write=True,
             )
             groups: dict[tuple, list[dict]] = {}
-            for c in (refreshed.data or []):
+            refreshed_rows = refreshed.json()
+            if not isinstance(refreshed_rows, list):
+                refreshed_rows = []
+            for c in refreshed_rows:
                 groups.setdefault(_cat_key(c), []).append(c)
             for _, group in groups.items():
                 if len(group) <= 1:
@@ -300,24 +353,31 @@ async def update_competition(comp_id: UUID, comp_update: CompetitionUpdate):
                     if cid == keep_id or cid in used_cat_ids:
                         continue
                     try:
-                        supabase.table("competition_categories").delete().eq("id", cid).execute()
+                        await rest_delete("competition_categories", {"id": f"eq.{cid}"})
                     except Exception:
                         pass
                 
         # Обновление секретарей (полная замена)
         if secretaries_data is not None:
-            supabase.table("competition_secretaries").delete().eq("competition_id", comp_id_str).execute()
+            await rest_delete("competition_secretaries", {"competition_id": f"eq.{comp_id_str}"})
             if secretaries_data:
                 secs_to_insert = [
                     {"competition_id": comp_id_str, "user_id": str(sec_id)}
                     for sec_id in secretaries_data
                 ]
-                supabase.table("competition_secretaries").insert(secs_to_insert).execute()
+                await rest_post("competition_secretaries", {}, secs_to_insert, prefer="return=minimal")
                 
         # Возвращаем обновленное соревнование
-        final_res = supabase.table("competitions").select("*, categories:competition_categories(*)").eq("id", comp_id_str).single().execute()
+        final_resp = await rest_get(
+            "competitions",
+            {"select": "*,categories:competition_categories(*)", "id": f"eq.{comp_id_str}", "limit": "1"},
+            write=False,
+        )
+        final_rows = final_resp.json()
+        if not isinstance(final_rows, list) or not final_rows:
+            raise HTTPException(status_code=404, detail="Competition not found")
         cache.invalidate_prefix("competitions:")
-        return final_res.data
+        return final_rows[0]
         
     except Exception as e:
         print(f"[Backend] ERROR in update_competition: {str(e)}")
@@ -381,7 +441,7 @@ async def upload_competition_preview(comp_id: UUID, file: UploadFile = File(...)
                 params={"id": f"eq.{str(comp_id)}"},
                 headers={
                     "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                    "apikey": SUPABASE_KEY,
+                    "apikey": SUPABASE_SERVICE_ROLE_KEY,
                     "Content-Type": "application/json",
                     "Prefer": "return=minimal",
                 },

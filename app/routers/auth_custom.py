@@ -1,8 +1,10 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 import os
 import smtplib
+import ssl
 from email.message import EmailMessage
+from email.utils import formataddr
 from app.core.otp_store import generate_code
 from app.core.otp_db import can_send as otp_can_send, store as otp_store_db, consume as otp_consume_db
 from app.core.supabase import SUPABASE_URL, SUPABASE_KEY, SUPABASE_SERVICE_ROLE_KEY
@@ -33,21 +35,43 @@ def _smtp_send(to_email: str, subject: str, html_body: str, text_body: str) -> N
     user = os.getenv("SMTP_USERNAME")
     pwd = os.getenv("SMTP_PASSWORD")
     from_email = os.getenv("SMTP_FROM_EMAIL") or "noreply@example.com"
+    from_name = (os.getenv("SMTP_FROM_NAME") or "").strip()
     if not host or not user or not pwd:
         raise HTTPException(status_code=500, detail="SMTP not configured")
+    use_ssl_env = (os.getenv("SMTP_USE_SSL") or "").strip().lower()
+    use_starttls_env = (os.getenv("SMTP_USE_STARTTLS") or "").strip().lower()
+    use_ssl = use_ssl_env in ("1", "true", "yes", "on") or port == 465
+    use_starttls = (
+        (use_starttls_env in ("", "1", "true", "yes", "on"))
+        if not use_ssl
+        else False
+    )
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"] = from_email
+    msg["From"] = formataddr((from_name, from_email)) if from_name else from_email
     msg["To"] = to_email
     msg.set_content(text_body)
     msg.add_alternative(html_body, subtype="html")
-    with smtplib.SMTP(host, port) as smtp:
-        smtp.starttls()
-        smtp.login(user, pwd)
-        smtp.send_message(msg)
+    try:
+        if use_ssl:
+            smtp = smtplib.SMTP_SSL(host, port, timeout=25)
+        else:
+            smtp = smtplib.SMTP(host, port, timeout=25)
+        with smtp:
+            smtp.ehlo_or_helo_if_needed()
+            if use_starttls:
+                ctx = ssl.create_default_context()
+                smtp.starttls(context=ctx)
+                smtp.ehlo_or_helo_if_needed()
+            smtp.login(user, pwd)
+            smtp.send_message(msg)
+    except smtplib.SMTPException as e:
+        raise HTTPException(status_code=500, detail=f"SMTP error: {type(e).__name__}") from e
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"SMTP connection error: {type(e).__name__}") from e
 
 @router.post("/otp/send")
-async def send_otp(body: SendOtpBody):
+async def send_otp(body: SendOtpBody, background_tasks: BackgroundTasks):
     email = _normalize_email(body.email)
     if not await otp_can_send(email, min_interval_seconds=60):
         raise HTTPException(status_code=429, detail="Повторная отправка доступна через 60 секунд")
@@ -59,8 +83,8 @@ async def send_otp(body: SendOtpBody):
     <p>Введите этот код на сайте. Код действует ограниченное время.</p>
     """
     text = f"Код подтверждения: {code}\nВведите этот код на сайте. Код действует ограниченное время."
-    _smtp_send(email, "Код подтверждения", html, text)
     await otp_store_db(email, code, ttl_seconds=600)
+    background_tasks.add_task(_smtp_send, email, "Код подтверждения", html, text)
     return {"ok": True}
 
 @router.post("/otp/verify")
@@ -92,7 +116,7 @@ async def verify_otp(body: VerifyOtpBody):
                 json={"password": body.password, "email_confirm": True},
                 headers={
                     "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                    "apikey": SUPABASE_KEY,
+                    "apikey": SUPABASE_SERVICE_ROLE_KEY,
                     "Content-Type": "application/json",
                 },
             )
@@ -104,7 +128,7 @@ async def verify_otp(body: VerifyOtpBody):
                 json={"email": email, "password": body.password, "email_confirm": True},
                 headers={
                     "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                    "apikey": SUPABASE_KEY,
+                    "apikey": SUPABASE_SERVICE_ROLE_KEY,
                     "Content-Type": "application/json",
                 },
             )

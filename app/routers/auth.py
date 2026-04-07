@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Header, Body, Query
 from fastapi.responses import RedirectResponse
 from app.core.supabase import SUPABASE_URL, SUPABASE_KEY, SUPABASE_SERVICE_ROLE_KEY, admin_supabase
 from app.core.telegram import send_telegram_notification
-from app.core.rest import rest_get
+from app.core.rest import rest_get, rest_patch
 import httpx
 import os
 import secrets
@@ -22,34 +22,34 @@ def _require_service_role():
     if not admin_supabase or not SUPABASE_SERVICE_ROLE_KEY:
         raise HTTPException(status_code=500, detail="Service role not configured")
 
-def _resolve_user_id(*, user_id: str | None, telegram_id: int | None) -> str:
+async def _resolve_user_id(*, user_id: str | None, telegram_id: int | None) -> str:
     if user_id:
         if telegram_id is None:
             return user_id
-        q = (
-            admin_supabase.table("users")
-            .select("id")
-            .eq("telegram_id", telegram_id)
-            .maybe_single()
-            .execute()
+        resp = await rest_get(
+            "users",
+            {"select": "id", "telegram_id": f"eq.{telegram_id}", "limit": "1"},
+            write=True,
         )
-        if not q.data or q.data.get("id") != user_id:
+        rows = resp.json()
+        row = rows[0] if isinstance(rows, list) and rows else None
+        if not isinstance(row, dict) or str(row.get("id")) != user_id:
             raise HTTPException(status_code=403, detail="user_id does not match telegram_id")
         return user_id
 
     if telegram_id is None:
         raise HTTPException(status_code=400, detail="telegram_id is required")
 
-    q = (
-        admin_supabase.table("users")
-        .select("id")
-        .eq("telegram_id", telegram_id)
-        .maybe_single()
-        .execute()
+    resp = await rest_get(
+        "users",
+        {"select": "id", "telegram_id": f"eq.{telegram_id}", "limit": "1"},
+        write=True,
     )
-    if not q.data:
+    rows = resp.json()
+    row = rows[0] if isinstance(rows, list) and rows else None
+    if not isinstance(row, dict) or not row.get("id"):
         raise HTTPException(status_code=404, detail="User not found by telegram_id")
-    return q.data.get("id")
+    return str(row.get("id"))
 
 async def _get_auth_admin_user(user_id: str) -> dict:
     async with httpx.AsyncClient() as client:
@@ -57,7 +57,7 @@ async def _get_auth_admin_user(user_id: str) -> dict:
             f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
             headers={
                 "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                "apikey": SUPABASE_KEY,
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
             },
         )
     if resp.status_code != 200:
@@ -102,7 +102,7 @@ async def _get_auth_user_by_email(email: str) -> dict | None:
                     f"{SUPABASE_URL}/auth/v1/admin/users",
                     headers={
                         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                        "apikey": SUPABASE_KEY,
+                        "apikey": SUPABASE_SERVICE_ROLE_KEY,
                     },
                     params={"page": page, "per_page": 200},
                 )
@@ -173,16 +173,6 @@ async def get_me(authorization: str | None = Header(default=None)):
     except Exception:
         res_data = None
 
-    if res_data is None:
-        res = (
-            admin_supabase.table("users")
-            .select("id, email, user_roles(roles(code))")
-            .eq("id", user_id)
-            .maybe_single()
-            .execute()
-        )
-        res_data = res.data if res and hasattr(res, "data") else None
-
     role_codes: list[str] = []
     if res_data and res_data.get("user_roles"):
         role_codes = [
@@ -227,14 +217,14 @@ async def bot_signup(
     telegram_id: int | None = Body(None),
 ):
     _require_service_role()
-    db_user_id = _resolve_user_id(user_id=user_id, telegram_id=telegram_id)
+    db_user_id = await _resolve_user_id(user_id=user_id, telegram_id=telegram_id)
 
     async with httpx.AsyncClient() as client:
         create_resp = await client.post(
             f"{SUPABASE_URL}/auth/v1/admin/users",
             headers={
                 "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                "apikey": SUPABASE_KEY,
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
                 "Content-Type": "application/json",
             },
             json={"email": email, "password": password, "email_confirm": False},
@@ -258,7 +248,7 @@ async def bot_signup(
                 print("[auth/bot-signup] resend failed", resend_resp.status_code, resend_resp.text)
 
     # Store email on our side too
-    admin_supabase.table("users").update({"email": email}).eq("id", db_user_id).execute()
+    await rest_patch("users", {"id": f"eq.{db_user_id}"}, {"email": email}, prefer="return=minimal")
 
     return {"ok": True}
 
@@ -270,7 +260,7 @@ async def bot_init_email(
 ):
     _require_service_role()
     # ensure user exists in our DB (will be used to persist email)
-    db_user_id = _resolve_user_id(user_id=user_id, telegram_id=telegram_id)
+    db_user_id = await _resolve_user_id(user_id=user_id, telegram_id=telegram_id)
     temp_password = secrets.token_urlsafe(18)
 
     # Create (or ensure) auth user by EMAIL only (we cannot set a custom id in Supabase Auth)
@@ -279,7 +269,7 @@ async def bot_init_email(
             f"{SUPABASE_URL}/auth/v1/admin/users",
             headers={
                 "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                "apikey": SUPABASE_KEY,
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
                 "Content-Type": "application/json",
             },
             json={
@@ -315,7 +305,7 @@ async def bot_init_email(
                 print("[auth/bot-init-email] resend failed", resend_resp.status_code, resend_resp.text)
 
     # Сохраняем email у нас
-    admin_supabase.table("users").update({"email": email}).eq("id", db_user_id).execute()
+    await rest_patch("users", {"id": f"eq.{db_user_id}"}, {"email": email}, prefer="return=minimal")
     return {"ok": True}
 
 @router.post("/bot-set-password")
@@ -325,13 +315,14 @@ async def bot_set_password(
     telegram_id: int | None = Body(None),
 ):
     _require_service_role()
-    db_user_id = _resolve_user_id(user_id=user_id, telegram_id=telegram_id)
+    db_user_id = await _resolve_user_id(user_id=user_id, telegram_id=telegram_id)
     if len(password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
 
     # Получаем email из нашей таблицы
-    row = admin_supabase.table("users").select("email").eq("id", db_user_id).maybe_single().execute()
-    email = row.data.get("email") if row and row.data else None
+    row_resp = await rest_get("users", {"select": "email", "id": f"eq.{db_user_id}", "limit": "1"}, write=True)
+    row_rows = row_resp.json()
+    email = row_rows[0].get("email") if isinstance(row_rows, list) and row_rows and isinstance(row_rows[0], dict) else None
     if not email:
         raise HTTPException(status_code=400, detail="Email not set in users table")
 
@@ -339,7 +330,7 @@ async def bot_set_password(
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             f"{SUPABASE_URL}/auth/v1/admin/users",
-            headers={"Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}", "apikey": SUPABASE_KEY},
+            headers={"Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}", "apikey": SUPABASE_SERVICE_ROLE_KEY},
             params={"email": email},
         )
     if resp.status_code != 200:
@@ -357,7 +348,7 @@ async def bot_set_password(
             f"{SUPABASE_URL}/auth/v1/admin/users/{auth_id}",
             headers={
                 "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                "apikey": SUPABASE_KEY,
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
                 "Content-Type": "application/json",
             },
             json={"password": password},
@@ -372,16 +363,17 @@ async def bot_confirmation_status(
     telegram_id: int | None = None,
 ):
     _require_service_role()
-    db_user_id = _resolve_user_id(user_id=user_id, telegram_id=telegram_id)
-    row = admin_supabase.table("users").select("email").eq("id", db_user_id).maybe_single().execute()
-    email = row.data.get("email") if row and row.data else None
+    db_user_id = await _resolve_user_id(user_id=user_id, telegram_id=telegram_id)
+    row_resp = await rest_get("users", {"select": "email", "id": f"eq.{db_user_id}", "limit": "1"}, write=True)
+    row_rows = row_resp.json()
+    email = row_rows[0].get("email") if isinstance(row_rows, list) and row_rows and isinstance(row_rows[0], dict) else None
     if not email:
         return {"confirmed": False, "email": None}
 
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             f"{SUPABASE_URL}/auth/v1/admin/users",
-            headers={"Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}", "apikey": SUPABASE_KEY},
+            headers={"Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}", "apikey": SUPABASE_SERVICE_ROLE_KEY},
             params={"email": email},
         )
     if resp.status_code != 200:
@@ -399,18 +391,19 @@ async def bot_update_email(
     telegram_id: int | None = Body(None),
 ):
     _require_service_role()
-    db_user_id = _resolve_user_id(user_id=user_id, telegram_id=telegram_id)
+    db_user_id = await _resolve_user_id(user_id=user_id, telegram_id=telegram_id)
 
     # Найдем auth user по текущему email (если есть)
-    row = admin_supabase.table("users").select("email").eq("id", db_user_id).maybe_single().execute()
-    current_email = row.data.get("email") if row and row.data else None
+    row_resp = await rest_get("users", {"select": "email", "id": f"eq.{db_user_id}", "limit": "1"}, write=True)
+    row_rows = row_resp.json()
+    current_email = row_rows[0].get("email") if isinstance(row_rows, list) and row_rows and isinstance(row_rows[0], dict) else None
 
     auth_id = None
     if current_email:
       async with httpx.AsyncClient() as client:
         resp = await client.get(
             f"{SUPABASE_URL}/auth/v1/admin/users",
-            headers={"Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}", "apikey": SUPABASE_KEY},
+            headers={"Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}", "apikey": SUPABASE_SERVICE_ROLE_KEY},
             params={"email": current_email},
         )
       if resp.status_code == 200:
@@ -425,7 +418,7 @@ async def bot_update_email(
                 f"{SUPABASE_URL}/auth/v1/admin/users/{auth_id}",
                 headers={
                     "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                    "apikey": SUPABASE_KEY,
+                    "apikey": SUPABASE_SERVICE_ROLE_KEY,
                     "Content-Type": "application/json",
                 },
                 json={"email": new_email, "email_confirm": False},
@@ -440,7 +433,7 @@ async def bot_update_email(
                 f"{SUPABASE_URL}/auth/v1/admin/users",
                 headers={
                     "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                    "apikey": SUPABASE_KEY,
+                    "apikey": SUPABASE_SERVICE_ROLE_KEY,
                     "Content-Type": "application/json",
                 },
                 json={"email": new_email, "password": temp_password, "email_confirm": False},
@@ -458,7 +451,7 @@ async def bot_update_email(
         if APP_DEBUG:
             print("[auth/bot-update-email] resend failed", resend_resp.status_code, resend_resp.text)
 
-    admin_supabase.table("users").update({"email": new_email}).eq("id", db_user_id).execute()
+    await rest_patch("users", {"id": f"eq.{db_user_id}"}, {"email": new_email}, prefer="return=minimal")
     return {"ok": True}
 
 @router.post("/bot-resend-confirmation")

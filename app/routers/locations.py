@@ -1,10 +1,8 @@
 from fastapi import APIRouter, HTTPException
 from typing import List, Optional
 from uuid import UUID
-from app.core.supabase import supabase
 from app.core.rest import rest_get
 from pydantic import BaseModel
-import anyio
 from app.core.cache import cache
 
 router = APIRouter(prefix="/locations", tags=["locations"])
@@ -27,7 +25,7 @@ async def get_locations(type: Optional[str] = None, parent_id: Optional[str] = N
     if cached is not None:
         return cached
 
-    params = {"select": "*", "order": "name.asc"}
+    params = {"select": "id,name,type,parent_id", "order": "name.asc"}
     if type:
         params["type"] = f"eq.{type}"
     if parent_id:
@@ -35,14 +33,8 @@ async def get_locations(type: Optional[str] = None, parent_id: Optional[str] = N
     try:
         resp = await rest_get("locations", params, write=False)
         data = resp.json()
-    except Exception:
-        query = supabase.table("locations").select("*")
-        if type:
-            query = query.eq("type", type)
-        if parent_id:
-            query = query.eq("parent_id", parent_id)
-        response = await anyio.to_thread.run_sync(query.order("name").execute)
-        data = response.data
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Supabase unavailable: {repr(e)}")
     cache.set(cache_key, data, ttl_seconds=60.0)
     return data
 
@@ -55,27 +47,13 @@ async def get_location_path(location_id: str):
         return cached
 
     async def _fetch_loc(loc_id: str) -> dict:
-        try:
-            resp = await rest_get(
-                "locations",
-                {"select": "id,type,parent_id", "id": f"eq.{loc_id}"},
-                write=False,
-            )
-            j = resp.json()
-            row = (j[0] if isinstance(j, list) and j else {}) if isinstance(j, list) else (j or {})
-            return row or {}
-        except Exception:
-            def _fetch_sync(lid: str):
-                q = (
-                    supabase.table("locations")
-                    .select("id,type,parent_id")
-                    .eq("id", lid)
-                    .maybe_single()
-                )
-                return q.execute()
-
-            res = await anyio.to_thread.run_sync(_fetch_sync, loc_id)
-            return res.data or {}
+        resp = await rest_get(
+            "locations",
+            {"select": "id,type,parent_id", "id": f"eq.{loc_id}", "limit": "1"},
+            write=False,
+        )
+        j = resp.json()
+        return j[0] if isinstance(j, list) and j else {}
 
     try:
         loc = await _fetch_loc(location_id)
