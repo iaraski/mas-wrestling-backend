@@ -964,14 +964,32 @@ async def _get_athlete_name_map(athlete_ids: list[str]) -> dict[str, str]:
     return athlete_to_name
 
 
-def _category_label(cat: dict) -> str:
-    gender = cat.get("gender")
-    g = "Мужчины" if gender == "male" else "Женщины" if gender == "female" else "Категория"
+def _category_label(cat: dict, *, at_date: str | None = None) -> str:
+    gender = str(cat.get("gender") or "").lower()
+    is_male = gender in ("male", "m")
+    is_female = gender in ("female", "f")
+
     age_min = cat.get("age_min")
     age_max = cat.get("age_max")
     w_min = cat.get("weight_min")
     w_max = cat.get("weight_max")
-    age_part = f"{age_min}-{age_max}" if age_min is not None and age_max is not None else ""
+
+    group = "Мужчины" if is_male else "Женщины" if is_female else "Мужчины"
+    if age_min == 18 and age_max == 21:
+        group = "Юниоры" if is_male else "Юниорки" if is_female else "Юниоры"
+    elif isinstance(age_max, int) and age_max < 18:
+        group = "Юноши" if is_male else "Девушки" if is_female else "Юноши"
+
+    year = datetime.now().year
+    if at_date:
+        try:
+            year = datetime.fromisoformat(str(at_date).replace("Z", "+00:00")).year
+        except Exception:
+            year = datetime.now().year
+    years_part = ""
+    if isinstance(age_min, int) and isinstance(age_max, int):
+        years_part = f"{year - age_max}-{year - age_min} г.р."
+
     def _fmt_num(x):
         try:
             xi = int(x)
@@ -980,18 +998,19 @@ def _category_label(cat: dict) -> str:
         except Exception:
             pass
         return str(x)
-    if w_max is not None:
-        try:
-            if float(w_max) >= 999 and w_min is not None:
-                weight_part = f"{_fmt_num(w_min)}+"
-            else:
-                weight_part = f"до {_fmt_num(w_max)} кг"
-        except Exception:
-            weight_part = f"до {_fmt_num(w_max)} кг"
+
+    if w_max is None or (isinstance(w_max, (int, float)) and float(w_max) >= 999):
+        minv = float(w_min) if w_min is not None else 0.0
+        if minv <= 0:
+            weight_part = "абсолютная"
+        else:
+            weight_part = f"{_fmt_num(int(minv))}+ кг"
     else:
-        weight_part = f"{_fmt_num(w_min)}+" if w_min is not None else ""
-    parts = [p for p in [g, age_part, weight_part] if p]
-    return " ".join(parts)
+        weight_part = f"до {_fmt_num(w_max)} кг"
+
+    if years_part:
+        return f"{group} {years_part}, {weight_part}"
+    return f"{group}, {weight_part}"
 
 
 def _balanced_assignments(
@@ -1161,8 +1180,9 @@ async def generate_live_bouts(comp_id: UUID, body: GenerateLiveBoutsRequest):
         raise HTTPException(status_code=500, detail="Service role not configured")
 
     comp_id_str = str(comp_id)
-    mats_res = await _execute(admin_supabase.table("competitions").select("mats_count").eq("id", comp_id_str).single())
+    mats_res = await _execute(admin_supabase.table("competitions").select("mats_count,start_date").eq("id", comp_id_str).single())
     mats_count = int((mats_res.data or {}).get("mats_count") or 1)
+    comp_start = (mats_res.data or {}).get("start_date")
 
     started_res = await _execute(
         admin_supabase.table("competition_bouts")
@@ -1227,6 +1247,12 @@ async def generate_live_bouts(comp_id: UUID, body: GenerateLiveBoutsRequest):
         cat_to_withdrawn[cat_id] = withdrawn_ids
         weighed_counts[cat_id] = len(athlete_ids)
 
+    active_categories = []
+    for cat in categories:
+        cat_id = str(cat["id"])
+        if len(cat_to_athletes.get(cat_id) or []) >= 2:
+            active_categories.append(cat)
+
     existing_assignments_res = await _execute(
         admin_supabase.table("competition_category_assignments")
         .select("category_id, mat_number")
@@ -1250,15 +1276,33 @@ async def generate_live_bouts(comp_id: UUID, body: GenerateLiveBoutsRequest):
     if body.active_mats is not None and not allowed_mats:
         raise HTTPException(status_code=400, detail="active_mats must include at least one mat")
     assignments = _balanced_assignments(
-        categories,
+        active_categories,
         weighed_counts,
         mats_count,
         {} if body.rebalance_assignments else existing_assignments,
         allowed_mats=allowed_mats,
     )
 
-
-    await _ensure_category_assignments(comp_id_str, assignments)
+    if assignments:
+        await _ensure_category_assignments(comp_id_str, assignments)
+        keep = set(assignments.keys())
+        if existing_assignments:
+            to_delete = [cid for cid in existing_assignments.keys() if cid not in keep]
+            for i in range(0, len(to_delete), 200):
+                chunk = to_delete[i : i + 200]
+                await _execute(
+                    admin_supabase.table("competition_category_assignments")
+                    .delete()
+                    .eq("competition_id", comp_id_str)
+                    .in_("category_id", chunk)
+                )
+    else:
+        if existing_assignments:
+            await _execute(
+                admin_supabase.table("competition_category_assignments")
+                .delete()
+                .eq("competition_id", comp_id_str)
+            )
     await _ensure_competition_mats(comp_id_str, mats_count)
 
     all_athlete_ids = []
@@ -1272,15 +1316,12 @@ async def generate_live_bouts(comp_id: UUID, body: GenerateLiveBoutsRequest):
 
     bouts_to_insert: list[dict] = []
     sortable_bouts: list[tuple[int, int, str, int, dict]] = []
-    cat_label_by_id = {str(c["id"]): _category_label(c) for c in categories if c.get("id")}
+    cat_label_by_id = {str(c["id"]): _category_label(c, at_date=comp_start) for c in active_categories if c.get("id")}
     seq = 0
 
-    for cat in categories:
+    for cat in active_categories:
         cat_id = str(cat["id"])
         athlete_ids = cat_to_athletes.get(cat_id, [])
-        if len(athlete_ids) < 2:
-            continue
-
         mat_number = int(assignments.get(cat_id) or 1)
         cat_label = cat_label_by_id.get(cat_id) or cat_id
 
@@ -1489,10 +1530,11 @@ async def get_live_state(comp_id: UUID):
         raise HTTPException(status_code=500, detail="Service role not configured")
     comp_id_str = str(comp_id)
     comp_res = await _execute(
-        admin_supabase.table("competitions").select("id,mats_count,name").eq("id", comp_id_str).single()
+        admin_supabase.table("competitions").select("id,mats_count,name,start_date").eq("id", comp_id_str).single()
     )
     comp = comp_res.data or {}
     mats_count = int(comp.get("mats_count") or 1)
+    comp_start = comp.get("start_date")
 
     cats_res = await _execute(
         admin_supabase.table("competition_categories").select("id,gender,age_min,age_max,weight_min,weight_max").eq("competition_id", comp_id_str)
@@ -1504,25 +1546,29 @@ async def get_live_state(comp_id: UUID):
     )
     assigns = assigns_res.data or []
 
+    bouts_res = await _select_competition_bouts_for_comp(comp_id_str)
+    bouts_all = bouts_res.data or []
+    cats_with_bouts = {str(b.get("category_id")) for b in bouts_all if b.get("category_id")}
+
     cats_by_mat: dict[int, list[dict]] = {m: [] for m in range(1, mats_count + 1)}
     for a in assigns:
         cat_id = str(a.get("category_id") or "")
         mat = int(a.get("mat_number") or 0)
         if mat < 1 or mat > mats_count:
             continue
+        if cat_id and cat_id not in cats_with_bouts:
+            continue
         cat = categories.get(cat_id)
         if not cat:
             continue
-        cats_by_mat[mat].append({"id": cat_id, "label": _category_label(cat)})
+        cats_by_mat[mat].append({"id": cat_id, "label": _category_label(cat, at_date=comp_start)})
 
     mats_res = await _execute(
         admin_supabase.table("competition_mats").select("mat_number,current_bout_id").eq("competition_id", comp_id_str)
     )
     mats_rows = mats_res.data or []
 
-    bouts_res = await _select_competition_bouts_for_comp(comp_id_str)
-    bouts = bouts_res.data or []
-    bouts = [b for b in bouts if b.get("status") in ("queued", "next", "running")]
+    bouts = [b for b in bouts_all if b.get("status") in ("queued", "next", "running")]
     bouts = await _materialize_names_for_bouts(bouts)
     has_bouts = bool(bouts)
     started_res = await _execute(
@@ -2157,20 +2203,23 @@ async def cleanup_seed_users(comp_id: UUID, body: CleanupSeedUsersRequest):
 
 @router.post("/categories/{category_id}/move")
 async def move_category(category_id: UUID, body: MoveCategoryRequest):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
     comp_id_str = str(body.competition_id)
     cat_id_str = str(category_id)
     to_mat = int(body.to_mat_number)
-    if to_mat < 1:
+    mats_count = await _get_mats_count(comp_id_str)
+    if to_mat < 1 or to_mat > mats_count:
         raise HTTPException(status_code=400, detail="Invalid mat number")
 
     await _ensure_category_assignments(comp_id_str, {cat_id_str: to_mat})
 
     existing = await _execute(
-        supabase.table("competition_bouts")
+        admin_supabase.table("competition_bouts")
         .select("id, mat_number, order_in_mat, status")
         .eq("competition_id", comp_id_str)
         .eq("category_id", cat_id_str)
-        .in_("status", ["queued", "next"])
+        .in_("status", ["queued", "next", "running"])
         .order("order_in_mat", desc=False)
     )
     bouts = existing.data or []
@@ -2178,17 +2227,37 @@ async def move_category(category_id: UUID, body: MoveCategoryRequest):
         return {"ok": True, "moved": 0}
 
     max_on_target = await _execute(
-        supabase.table("competition_bouts")
+        admin_supabase.table("competition_bouts")
         .select("order_in_mat")
         .eq("competition_id", comp_id_str)
         .eq("mat_number", to_mat)
+        .in_("status", ["queued", "next", "running"])
         .order("order_in_mat", desc=True)
         .limit(1)
     )
     base = int((max_on_target.data or [{}])[0].get("order_in_mat") or 0)
+    affected_mats = {int(b.get("mat_number") or 0) for b in bouts if int(b.get("mat_number") or 0) > 0}
+    affected_mats.add(int(to_mat))
+
+    running_bout_id: str | None = None
+    running_from_mat: int | None = None
+    for b in bouts:
+        if str(b.get("status") or "") == "running":
+            running_bout_id = str(b.get("id"))
+            running_from_mat = int(b.get("mat_number") or 0) or None
+            break
+
+    priority = {"running": 0, "next": 1, "queued": 2}
+    bouts_sorted = sorted(
+        bouts,
+        key=lambda x: (
+            priority.get(str(x.get("status") or ""), 9),
+            int(x.get("order_in_mat") or 0),
+        ),
+    )
     updates = []
     order = base + 1
-    for b in bouts:
+    for b in bouts_sorted:
         updates.append({"id": str(b["id"]), "mat_number": to_mat, "order_in_mat": order})
         order += 1
 
@@ -2196,10 +2265,28 @@ async def move_category(category_id: UUID, body: MoveCategoryRequest):
         chunk = updates[i : i + 200]
         for row in chunk:
             await _execute(
-                supabase.table("competition_bouts")
+                admin_supabase.table("competition_bouts")
                 .update({"mat_number": row["mat_number"], "order_in_mat": row["order_in_mat"]})
                 .eq("id", row["id"])
             )
+
+    if running_bout_id and running_from_mat and running_from_mat != int(to_mat):
+        await _execute(
+            admin_supabase.table("competition_mats")
+            .update({"current_bout_id": None})
+            .eq("competition_id", comp_id_str)
+            .eq("mat_number", int(running_from_mat))
+            .eq("current_bout_id", running_bout_id)
+        )
+        await _execute(
+            admin_supabase.table("competition_mats")
+            .update({"current_bout_id": running_bout_id})
+            .eq("competition_id", comp_id_str)
+            .eq("mat_number", int(to_mat))
+        )
+
+    for m in sorted(affected_mats):
+        await _set_next_for_mat(comp_id_str, int(m))
 
     return {"ok": True, "moved": len(updates), "to_mat_number": to_mat}
 
