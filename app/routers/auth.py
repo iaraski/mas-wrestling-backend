@@ -1,8 +1,10 @@
 from fastapi import APIRouter, HTTPException, Header, Body, Query
+from pydantic import BaseModel
 from fastapi.responses import RedirectResponse
 from app.core.supabase import SUPABASE_URL, SUPABASE_KEY, SUPABASE_SERVICE_ROLE_KEY, admin_supabase
 from app.core.telegram import send_telegram_notification
 from app.core.rest import rest_get, rest_patch
+from app.core.local_auth import issue_access_token, supabase_password_grant, verify_access_token, verify_user_password, set_user_password
 import httpx
 import os
 import secrets
@@ -140,6 +142,52 @@ async def get_me(authorization: str | None = Header(default=None)):
         return cached[1]
 
     try:
+        payload = verify_access_token(token)
+        user_id = str(payload.get("sub"))
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        res_data = None
+        try:
+            resp = await rest_get(
+                "users",
+                {"select": "id,email,user_roles(roles(code))", "id": f"eq.{user_id}", "limit": "1"},
+                write=True,
+            )
+            rows = resp.json()
+            if isinstance(rows, list) and rows:
+                res_data = rows[0]
+        except Exception:
+            res_data = None
+
+        role_codes: list[str] = []
+        if res_data and res_data.get("user_roles"):
+            role_codes = [
+                ur.get("roles", {}).get("code")
+                for ur in res_data.get("user_roles", [])
+                if ur and ur.get("roles") and ur.get("roles", {}).get("code")
+            ]
+
+        is_admin = any(c in ["admin", "founder", "country_admin", "region_admin", "country_secretary", "region_secretary"] for c in role_codes)
+        is_secretary = any(c in ["secretary", "country_secretary", "region_secretary"] for c in role_codes)
+
+        primary_role = "athlete"
+        if is_admin:
+            primary_role = "admin"
+        elif is_secretary:
+            primary_role = "secretary"
+
+        result = {
+            "user_id": user_id,
+            "email": res_data.get("email") if res_data else payload.get("email"),
+            "role_codes": role_codes,
+            "role": primary_role,
+        }
+        _me_cache[cache_key] = (time.time() + 30.0, result)
+        return result
+    except HTTPException:
+        pass
+
+    try:
         timeout = httpx.Timeout(25.0, connect=5.0)
         async with httpx.AsyncClient(timeout=timeout, http2=False, transport=httpx.AsyncHTTPTransport(retries=2)) as client:
             resp = await client.get(
@@ -201,6 +249,87 @@ async def get_me(authorization: str | None = Header(default=None)):
     }
     _me_cache[cache_key] = (time.time() + 30.0, result)
     return result
+
+
+class LoginBody(BaseModel):
+    email: str
+    password: str
+
+
+@router.post("/login")
+async def login(body: LoginBody):
+    email = _norm_email(body.email)
+    password = str(body.password or "")
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Пароль должен быть не короче 8 символов")
+
+    resp = await rest_get(
+        "users",
+        {"select": "id,email,user_roles(roles(code))", "email": f"eq.{email}", "limit": "1"},
+        write=True,
+    )
+    rows = resp.json()
+    row = rows[0] if isinstance(rows, list) and rows else None
+    if not isinstance(row, dict) or not row.get("id"):
+        grant = await supabase_password_grant(email, password)
+        user_obj = grant.get("user") if isinstance(grant, dict) else None
+        supa_id = user_obj.get("id") if isinstance(user_obj, dict) else None
+        if not supa_id:
+            raise HTTPException(status_code=401, detail="Invalid login credentials")
+        user_id = str(supa_id)
+        try:
+            await rest_upsert("users", {"id": user_id, "email": email}, on_conflict="id")
+        except Exception:
+            pass
+        migrated = await set_user_password(user_id, password)
+        access_token = issue_access_token(user_id=user_id, email=email)
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user_id": user_id,
+            "email": email,
+            "role_codes": [],
+            "role": "athlete",
+            "migrated": migrated,
+        }
+
+    user_id = str(row["id"])
+
+    migrated = False
+    ok_local = await verify_user_password(user_id, password)
+    if not ok_local:
+        grant = await supabase_password_grant(email, password)
+        user_obj = grant.get("user") if isinstance(grant, dict) else None
+        supa_id = user_obj.get("id") if isinstance(user_obj, dict) else None
+        if not supa_id:
+            raise HTTPException(status_code=401, detail="Invalid login credentials")
+        migrated = await set_user_password(user_id, password)
+
+    role_codes: list[str] = []
+    if row.get("user_roles"):
+        role_codes = [
+            ur.get("roles", {}).get("code")
+            for ur in row.get("user_roles", [])
+            if ur and ur.get("roles") and ur.get("roles", {}).get("code")
+        ]
+    is_admin = any(c in ["admin", "founder", "country_admin", "region_admin", "country_secretary", "region_secretary"] for c in role_codes)
+    is_secretary = any(c in ["secretary", "country_secretary", "region_secretary"] for c in role_codes)
+    primary_role = "athlete"
+    if is_admin:
+        primary_role = "admin"
+    elif is_secretary:
+        primary_role = "secretary"
+
+    access_token = issue_access_token(user_id=user_id, email=email)
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user_id": user_id,
+        "email": email,
+        "role_codes": role_codes,
+        "role": primary_role,
+        "migrated": migrated,
+    }
 
 @router.post("/debug/clear-cache")
 async def debug_clear_cache():

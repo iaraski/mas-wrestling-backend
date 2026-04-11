@@ -10,6 +10,7 @@ import anyio
 from app.core.supabase import supabase, admin_supabase
 from app.core.rest import rest_get, rest_post, rest_upsert, rest_patch, rest_delete
 from app.core.supabase import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+from app.core.local_auth import get_user_id_from_bearer as _local_get_user_id_from_bearer
 from app.schemas.competition import Application, ApplicationCreate, ApplicationUpdate
 
 from app.core.telegram import send_telegram_notification, get_telegram_file_url
@@ -138,36 +139,7 @@ async def _get_user_id_from_bearer(authorization: str | None) -> str:
     cached = _me_cache.get(cache_key)
     if cached and cached[0] > time.time():
         return cached[1]
-
-    if not admin_supabase:
-        raise HTTPException(status_code=500, detail="Service role not configured")
-
-    def _sync_get_user():
-        return admin_supabase.auth.get_user(token)
-
-    try:
-        auth_res = await anyio.to_thread.run_sync(_sync_get_user)
-    except Exception as e:
-        msg = repr(e)
-        lowered = msg.lower()
-        if "jwt" in lowered or "token" in lowered or "401" in lowered or "403" in lowered:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        raise HTTPException(status_code=503, detail=f"Supabase Auth unavailable: {msg}")
-
-    user_obj = None
-    if isinstance(auth_res, dict):
-        user_obj = auth_res.get("user") or auth_res.get("data") or auth_res.get("user_data")
-    else:
-        user_obj = getattr(auth_res, "user", None) or getattr(auth_res, "data", None)
-
-    user_id = None
-    if hasattr(user_obj, "id"):
-        user_id = getattr(user_obj, "id")
-    elif isinstance(user_obj, dict):
-        user_id = user_obj.get("id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
+    user_id = await _local_get_user_id_from_bearer(authorization)
     _me_cache[cache_key] = (time.time() + 30.0, user_id)
     return user_id
 
