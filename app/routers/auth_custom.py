@@ -292,18 +292,24 @@ def _smtp_send(to_email: str, subject: str, html_body: str, text_body: str) -> N
             raise HTTPException(status_code=500, detail=f"SMTP error: {type(e).__name__}: {str(e) or ''}".strip()) from e
 
 
-def _smtp_send_background(to_email: str, subject: str, html_body: str, text_body: str) -> None:
+def _smtp_send_background(
+    to_email: str,
+    subject: str,
+    html_body: str,
+    text_body: str,
+    rl_key: str | None = None,
+) -> None:
     try:
         _smtp_send(to_email, subject, html_body, text_body)
     except HTTPException as e:
         otp_delete_db_sync(to_email)
         with _send_rl_lock:
-            _send_next_allowed.pop(str(to_email), None)
+            _send_next_allowed.pop(rl_key or str(to_email), None)
         print(f"[OTP] SMTP send failed to={to_email}: {e.detail}")
     except Exception as e:
         otp_delete_db_sync(to_email)
         with _send_rl_lock:
-            _send_next_allowed.pop(str(to_email), None)
+            _send_next_allowed.pop(rl_key or str(to_email), None)
         print(f"[OTP] SMTP send failed to={to_email}: {repr(e)}")
 
 @router.post("/otp/send")
@@ -432,6 +438,15 @@ async def reset_send(body: ResetSendBody):
             with _send_rl_lock:
                 _send_next_allowed.pop(key, None)
             raise HTTPException(status_code=503, detail="OTP storage unavailable")
+        send_async_env = (os.getenv("SMTP_SEND_ASYNC") or "").strip().lower()
+        send_async = send_async_env in ("1", "true", "yes", "on")
+        if send_async:
+            threading.Thread(
+                target=_smtp_send_background,
+                args=(email, "Восстановление пароля", html, text, key),
+                daemon=True,
+            ).start()
+            return {"ok": True, "queued": True}
         _smtp_send(email, "Восстановление пароля", html, text)
         return {"ok": True, "queued": False}
     except HTTPException:

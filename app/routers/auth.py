@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from fastapi.responses import RedirectResponse
 from app.core.supabase import SUPABASE_URL, SUPABASE_KEY, SUPABASE_SERVICE_ROLE_KEY, admin_supabase
 from app.core.telegram import send_telegram_notification
-from app.core.rest import rest_get, rest_patch
+from app.core.rest import rest_get, rest_patch, rest_upsert
 from app.core.local_auth import issue_access_token, supabase_password_grant, verify_access_token, verify_user_password, set_user_password
 import httpx
 import os
