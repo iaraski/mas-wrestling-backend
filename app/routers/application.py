@@ -667,7 +667,7 @@ async def admin_apply_athlete_to_category(
                 "competition_id": competition_id,
                 "athlete_id": str(body.athlete_id),
                 "category_id": cat_id,
-                "status": "approved",
+                "status": "pending",
             },
             prefer="return=representation",
         )
