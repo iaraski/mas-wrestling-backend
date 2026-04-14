@@ -101,6 +101,12 @@ class _PGClient:
                 resp = self._http.request(method, url, params=params, headers=headers, json=json)
                 if resp.status_code >= 500:
                     raise RuntimeError(f"Server error {resp.status_code}")
+                if resp.status_code >= 400:
+                    try:
+                        payload = resp.json()
+                    except Exception:
+                        payload = resp.text
+                    raise RuntimeError(f"PostgREST error {resp.status_code}: {payload}")
                 if resp.status_code == 204 or not resp.content:
                     return _PGResponse(None)
                 return _PGResponse(resp.json())
@@ -160,8 +166,13 @@ class _PGQuery:
         self._params["or"] = expr
         return self
 
-    def order(self, col: str, desc: bool = False):
-        self._order.append(f"{col}.{'desc' if desc else 'asc'}")
+    def order(self, col: str, desc: bool = False, nullsfirst: bool | None = None):
+        part = f"{col}.{'desc' if desc else 'asc'}"
+        if nullsfirst is True:
+            part += ".nullsfirst"
+        elif nullsfirst is False:
+            part += ".nullslast"
+        self._order.append(part)
         return self
 
     def limit(self, n: int):

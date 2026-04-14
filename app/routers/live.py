@@ -126,6 +126,8 @@ async def _advance_double_elim_for_category(
     cols = "id,athlete_red_id,athlete_blue_id,winner_athlete_id,status,stage,round_index,mat_number,order_in_mat"
     if await _competition_bouts_has_score_columns():
         cols += ",red_wins,blue_wins,wins_to"
+    if await _competition_bouts_has_name_columns():
+        cols += ",athlete_red_name,athlete_blue_name"
     res = await _execute(
         admin_supabase.table("competition_bouts")
         .select(cols)
@@ -165,47 +167,55 @@ async def _advance_double_elim_for_category(
     if len(participants) < 2:
         return 0
 
-    forbidden: set[tuple[str, str]] = set()
-    for b in bouts:
-        a = str(b.get("athlete_red_id") or "")
-        c = str(b.get("athlete_blue_id") or "")
-        if not a or not c or a == c:
-            continue
-        if a in withdrawn or c in withdrawn:
-            continue
-        forbidden.add(_pair_key(a, c))
-
-    losses: dict[str, int] = {p: 0 for p in participants}
-    drop_round: dict[str, int] = {}
-
-    for b in bouts:
-        a = str(b.get("athlete_red_id") or "")
-        c = str(b.get("athlete_blue_id") or "")
-        if not a or not c:
-            continue
-        if a in withdrawn or c in withdrawn:
-            continue
-        stage = b.get("stage")
-        r = int(b.get("round_index") or 0)
-        status = str(b.get("status") or "")
-        if status == "done" and a != c:
-            w = str(b.get("winner_athlete_id") or "")
-            if not w:
-                continue
-            loser = c if w == a else a
-            losses[loser] = int(losses.get(loser, 0)) + 1
-            if str(stage or "") == "wb":
-                drop_round[loser] = min(int(drop_round.get(loser, 10**9)), r)
-
-    wb_round = 1
-    for b in bouts:
-        if str(b.get("stage") or "") == "wb":
-            wb_round = max(wb_round, int(b.get("round_index") or 1))
-
     region_map = await _get_athlete_region_map(participants)
     name_map = await _get_athlete_name_map(participants)
     has_name_cols = await _competition_bouts_has_name_columns()
     has_scores = await _competition_bouts_has_score_columns()
+
+    def _next_pow2(n: int) -> int:
+        p = 1
+        while p < n:
+            p *= 2
+        return p
+
+    def _wb_rounds_total(n: int) -> int:
+        p = _next_pow2(n)
+        r = 0
+        while p > 1:
+            p //= 2
+            r += 1
+        return max(1, r)
+
+    def _stage_str(b: dict) -> str:
+        return str(b.get("stage") or "")
+
+    def _is_wb(b: dict) -> bool:
+        s = _stage_str(b).lower()
+        return s == "wb" or s == "bye" or s.startswith("bye_wb")
+
+    def _wb_round_of(b: dict) -> int:
+        s = _stage_str(b).lower()
+        if s == "bye":
+            return 1
+        if s.startswith("bye_wb"):
+            tail = s[len("bye_wb") :]
+            if tail.isdigit():
+                return int(tail)
+            return 1
+        return int(b.get("round_index") or 1)
+
+    def _lb_round_of(b: dict) -> int | None:
+        s = _stage_str(b).lower()
+        if s.startswith("bye_lb"):
+            tail = s[len("bye_lb") :]
+            return int(tail) if tail.isdigit() else None
+        if s.startswith("lb"):
+            tail = s[len("lb") :]
+            return int(tail) if tail.isdigit() else None
+        return None
+
+    def _overall_round_for_lb(lb_round: int) -> int:
+        return int(lb_round) + 1
 
     new_rows: list[dict] = []
 
@@ -255,6 +265,28 @@ async def _advance_double_elim_for_category(
             row["athlete_blue_name"] = name_map.get(b_id) or ""
         new_rows.append(row)
 
+    def _best_cross_pairs(left: list[str], right: list[str], forbidden: set[tuple[str, str]]) -> list[tuple[str, str]]:
+        l = [str(x) for x in left if x]
+        r = [str(x) for x in right if x]
+        if not l or not r:
+            return []
+        remaining = sorted(r)
+        pairs: list[tuple[str, str]] = []
+        for a in l:
+            if not remaining:
+                break
+            ra = region_map.get(a)
+            candidates = [b for b in remaining if _pair_key(a, b) not in forbidden]
+            if not candidates:
+                candidates = list(remaining)
+            candidates.sort(key=lambda b: (0 if (ra and region_map.get(b) and region_map.get(b) != ra) else 1, b))
+            b = candidates[0]
+            pairs.append((a, b))
+            remaining.remove(b)
+        return pairs
+
+    wb_total = _wb_rounds_total(len(participants))
+
     changed = True
     loops = 0
     while changed and loops < 20:
@@ -263,95 +295,185 @@ async def _advance_double_elim_for_category(
 
         bouts_all = bouts + new_rows
 
-        busy_now: set[str] = set()
-        has_lb_now: set[str] = set()
-        last_lb_round_now: dict[str, int] = {}
+        forbidden: set[tuple[str, str]] = set()
         for b in bouts_all:
             a = str(b.get("athlete_red_id") or "")
             c = str(b.get("athlete_blue_id") or "")
-            if not a or not c:
+            if not a or not c or a == c:
                 continue
+            if a in withdrawn or c in withdrawn:
+                continue
+            forbidden.add(_pair_key(a, c))
+
+        busy_now: set[str] = set()
+        for b in bouts_all:
             st = str(b.get("status") or "")
-            if st in ("queued", "next", "running"):
-                busy_now.add(a)
-                busy_now.add(c)
-            if _double_elim_is_lb_stage(b.get("stage")):
-                has_lb_now.add(a)
-                has_lb_now.add(c)
-                rr = int(b.get("round_index") or 0)
-                last_lb_round_now[a] = max(int(last_lb_round_now.get(a, 0)), rr)
-                last_lb_round_now[c] = max(int(last_lb_round_now.get(c, 0)), rr)
-
-        for r in range(1, wb_round + 1):
-            wb_done = True
-            for b in bouts_all:
-                if int(b.get("round_index") or 0) != int(r):
-                    continue
-                if not _double_elim_is_wb_stage(b.get("stage")):
-                    continue
-                if str(b.get("status") or "") != "done":
-                    wb_done = False
-                    break
-            if not wb_done:
+            if st not in ("queued", "next", "running"):
                 continue
+            a = str(b.get("athlete_red_id") or "")
+            c = str(b.get("athlete_blue_id") or "")
+            if not a or not c or a == c:
+                continue
+            busy_now.add(a)
+            busy_now.add(c)
 
-            if not _double_elim_any_round_exists(bouts_all, stage="lb_new", round_index=r):
-                pool = [
-                    a
-                    for a in participants
-                    if losses.get(a, 0) == 1
-                    and drop_round.get(a, 0) == r
-                    and (a not in has_lb_now)
-                    and (a not in busy_now)
-                ]
-                if pool:
-                    if len(pool) % 2 == 1:
-                        add_bye("bye_lb_new", r, pool.pop())
-                        changed = True
+        losses: dict[str, int] = {p: 0 for p in participants}
+        for b in bouts_all:
+            if str(b.get("status") or "") != "done":
+                continue
+            a = str(b.get("athlete_red_id") or "")
+            c = str(b.get("athlete_blue_id") or "")
+            if not a or not c or a == c:
+                continue
+            if a in withdrawn or c in withdrawn:
+                continue
+            w = str(b.get("winner_athlete_id") or "")
+            if not w:
+                continue
+            loser = c if w == a else a
+            losses[loser] = int(losses.get(loser, 0)) + 1
+
+        wb_bouts_by_round: dict[int, list[dict]] = {}
+        for b in bouts_all:
+            if not _is_wb(b):
+                continue
+            rr = _wb_round_of(b)
+            wb_bouts_by_round.setdefault(rr, []).append(b)
+
+        def wb_exists(r: int) -> bool:
+            return bool(wb_bouts_by_round.get(int(r)) or [])
+
+        def wb_done(r: int) -> bool:
+            rr = int(r)
+            xs = wb_bouts_by_round.get(rr) or []
+            if not xs:
+                return False
+            return all(str(b.get("status") or "") == "done" for b in xs)
+
+        def wb_losers(r: int) -> list[str]:
+            rr = int(r)
+            out: list[str] = []
+            for b in wb_bouts_by_round.get(rr) or []:
+                if str(b.get("status") or "") != "done":
+                    continue
+                a = str(b.get("athlete_red_id") or "")
+                c = str(b.get("athlete_blue_id") or "")
+                if not a or not c or a == c:
+                    continue
+                w = str(b.get("winner_athlete_id") or "")
+                if not w:
+                    continue
+                out.append(c if w == a else a)
+            return out
+
+        def wb_winners(r: int) -> list[str]:
+            rr = int(r)
+            out: list[str] = []
+            for b in wb_bouts_by_round.get(rr) or []:
+                if str(b.get("status") or "") != "done":
+                    continue
+                w = b.get("winner_athlete_id")
+                if w:
+                    out.append(str(w))
+            return out
+
+        lb_bouts_by_round: dict[int, list[dict]] = {}
+        for b in bouts_all:
+            lr = _lb_round_of(b)
+            if lr is None:
+                continue
+            lb_bouts_by_round.setdefault(int(lr), []).append(b)
+
+        def lb_exists(lr: int) -> bool:
+            return bool(lb_bouts_by_round.get(int(lr)) or [])
+
+        def lb_done(lr: int) -> bool:
+            xs = lb_bouts_by_round.get(int(lr)) or []
+            if not xs:
+                return False
+            return all(str(b.get("status") or "") == "done" for b in xs)
+
+        def lb_winners(lr: int) -> list[str]:
+            out: list[str] = []
+            for b in lb_bouts_by_round.get(int(lr)) or []:
+                if str(b.get("status") or "") != "done":
+                    continue
+                w = b.get("winner_athlete_id")
+                if w:
+                    out.append(str(w))
+            return out
+
+        wb_round_generated = max(wb_bouts_by_round.keys() or [1])
+        if wb_round_generated < wb_total and wb_exists(wb_round_generated) and wb_done(wb_round_generated):
+            nxt = wb_round_generated + 1
+            if not wb_exists(nxt):
+                pool = [p for p in participants if losses.get(p, 0) == 0 and p not in busy_now]
+                if len(pool) >= 2:
                     pairs = _best_pairs_no_repeat(pool, region_map, forbidden)
                     if len(pairs) * 2 == len(pool):
                         for a_id, b_id in pairs:
-                            add_bout("lb_new", r, a_id, b_id)
+                            add_bout("wb", nxt, a_id, b_id)
                             forbidden.add(_pair_key(a_id, b_id))
                         changed = True
 
-            if r >= 2 and not _double_elim_any_round_exists(bouts_all, stage="lb_old", round_index=r):
-                pool = [
-                    a
-                    for a in participants
-                    if losses.get(a, 0) == 1
-                    and drop_round.get(a, 0) < r
-                    and (a in has_lb_now)
-                    and int(last_lb_round_now.get(a, 0)) < r
-                    and (a not in busy_now)
-                ]
-                if pool:
-                    if len(pool) % 2 == 1:
-                        add_bye("bye_lb_old", r, pool.pop())
-                        changed = True
-                    pairs = _best_pairs_no_repeat(pool, region_map, forbidden)
-                    if len(pairs) * 2 == len(pool):
-                        for a_id, b_id in pairs:
-                            add_bout("lb_old", r, a_id, b_id)
-                            forbidden.add(_pair_key(a_id, b_id))
-                        changed = True
+        max_lb_generated = max(lb_bouts_by_round.keys() or [0])
+        next_lb = max_lb_generated + 1
+        if next_lb >= 1 and next_lb <= 2 * max(0, wb_total - 1) and not lb_exists(next_lb):
+            if next_lb == 1:
+                if wb_total >= 2 and wb_done(2):
+                    pool = [a for a in wb_losers(1) if a not in withdrawn and a not in busy_now and losses.get(a, 0) == 1]
+                    if pool:
+                        bye = None
+                        if len(pool) % 2 == 1:
+                            bye = pool.pop()
+                            add_bye("bye_lb1", _overall_round_for_lb(1), bye)
+                        pairs = _best_pairs_no_repeat(pool, region_map, forbidden)
+                        if len(pairs) * 2 == len(pool):
+                            for a_id, b_id in pairs:
+                                add_bout("lb1", _overall_round_for_lb(1), a_id, b_id)
+                                forbidden.add(_pair_key(a_id, b_id))
+                            changed = True
+            elif next_lb % 2 == 1:
+                if lb_done(next_lb - 1):
+                    pool = [a for a in lb_winners(next_lb - 1) if a not in withdrawn and a not in busy_now and losses.get(a, 0) == 1]
+                    if pool:
+                        bye = None
+                        if len(pool) % 2 == 1:
+                            bye = pool.pop()
+                            add_bye(f"bye_lb{next_lb}", _overall_round_for_lb(next_lb), bye)
+                        pairs = _best_pairs_no_repeat(pool, region_map, forbidden)
+                        if len(pairs) * 2 == len(pool):
+                            for a_id, b_id in pairs:
+                                add_bout(f"lb{next_lb}", _overall_round_for_lb(next_lb), a_id, b_id)
+                                forbidden.add(_pair_key(a_id, b_id))
+                            changed = True
+            else:
+                k = next_lb // 2
+                if lb_done(next_lb - 1) and wb_done(k + 1):
+                    left = [a for a in lb_winners(next_lb - 1) if a not in withdrawn and a not in busy_now and losses.get(a, 0) == 1]
+                    right = [a for a in wb_losers(k + 1) if a not in withdrawn and a not in busy_now and losses.get(a, 0) == 1]
+                    if left and right:
+                        pairs = _best_cross_pairs(left, right, forbidden)
+                        used_left = {a for a, _ in pairs}
+                        used_right = {b for _, b in pairs}
+                        if pairs:
+                            for a_id, b_id in pairs:
+                                add_bout(f"lb{next_lb}", _overall_round_for_lb(next_lb), a_id, b_id)
+                                forbidden.add(_pair_key(a_id, b_id))
+                            extras = [a for a in left if a not in used_left] + [b for b in right if b not in used_right]
+                            if extras:
+                                add_bye(f"bye_lb{next_lb}", _overall_round_for_lb(next_lb), extras[-1])
+                            changed = True
 
-            if r == wb_round and not _double_elim_any_round_exists(bouts_all, stage="wb", round_index=r + 1):
-                wb_pool = [a for a in participants if losses.get(a, 0) == 0 and a not in busy_now]
-                if len(wb_pool) >= 2:
-                    if len(wb_pool) % 2 == 1:
-                        add_bye("bye_wb", r + 1, wb_pool.pop())
-                        changed = True
-                    pairs = _best_pairs_no_repeat(wb_pool, region_map, forbidden)
-                    if len(pairs) * 2 == len(wb_pool):
-                        for a_id, b_id in pairs:
-                            add_bout("wb", r + 1, a_id, b_id)
-                            forbidden.add(_pair_key(a_id, b_id))
-                        wb_round = r + 1
-                        changed = True
-
-        # Финал (1-е и 2-е места) формируется в рамках WB как следующий раунд "wb".
-        # Лозерская сетка (Б) не даёт боя за 3-е место: два лучших из Б получают бронзы.
+        if wb_total >= 2:
+            final_exists = any(str(_stage_str(b) or "").lower() == "final" for b in bouts_all)
+            last_lb = 2 * max(0, wb_total - 1)
+            if not final_exists and wb_done(wb_total) and (last_lb == 0 or lb_done(last_lb)):
+                wb_champs = wb_winners(wb_total)
+                lb_champs = lb_winners(last_lb) if last_lb > 0 else []
+                if wb_champs and lb_champs:
+                    add_bout("final", 2 * wb_total, wb_champs[0], lb_champs[0])
+                    changed = True
 
     return await _append_competition_bouts(comp_id_str=comp_id_str, mat_number=mat_number, rows=new_rows)
 
@@ -369,6 +491,155 @@ class SeedFillRoundRobinRequest(BaseModel):
     min_per_category: int = 3
     max_per_category: int = 6
     start_draw_number: int = 10000
+
+
+async def _get_weight_map_for_category(db, *, comp_id_str: str, cat_id_str: str) -> dict[str, float]:
+    try:
+        apps_res = await _execute(
+            db.table("applications")
+            .select("athlete_id,actual_weight,declared_weight")
+            .eq("competition_id", comp_id_str)
+            .eq("category_id", cat_id_str)
+            .limit(10000)
+        )
+        weight_map: dict[str, float] = {}
+        for a in (apps_res.data or []):
+            a_id = a.get("athlete_id")
+            if not a_id:
+                continue
+            w = a.get("actual_weight")
+            if w is None:
+                w = a.get("declared_weight")
+            if w is None:
+                continue
+            try:
+                weight_map[str(a_id)] = float(w)
+            except Exception:
+                continue
+        return weight_map
+    except Exception:
+        return {}
+
+
+def _round_robin_rank_from_bouts(
+    *,
+    bouts: list[dict],
+    has_scores: bool,
+    weight_map: dict[str, float],
+) -> list[dict]:
+    done = [b for b in bouts if b.get("status") == "done" and b.get("winner_athlete_id")]
+
+    stats: dict[str, dict] = {}
+
+    def ensure(a_id: str):
+        if a_id not in stats:
+            stats[a_id] = {
+                "athlete_id": a_id,
+                "wins": 0,
+                "losses": 0,
+                "played": 0,
+                "match_points": 0,
+                "clean_wins": 0,
+                "points": 0,
+                "points_against": 0,
+            }
+
+    head_to_head: dict[tuple[str, str], int] = {}
+
+    for b in done:
+        red = str(b.get("athlete_red_id") or "")
+        blue = str(b.get("athlete_blue_id") or "")
+        winner = str(b.get("winner_athlete_id") or "")
+        if not red or not blue or not winner:
+            continue
+        ensure(red)
+        ensure(blue)
+        stats[red]["played"] += 1
+        stats[blue]["played"] += 1
+        if has_scores:
+            rw = int(b.get("red_wins") or 0)
+            bw = int(b.get("blue_wins") or 0)
+            wins_to = int(b.get("wins_to") or 2)
+            stats[red]["points"] += rw
+            stats[red]["points_against"] += bw
+            stats[blue]["points"] += bw
+            stats[blue]["points_against"] += rw
+        if winner == red:
+            stats[red]["wins"] += 1
+            stats[blue]["losses"] += 1
+            head_to_head[(red, blue)] = 1
+            head_to_head[(blue, red)] = 0
+            if has_scores:
+                winner_rounds = int(rw)
+                loser_rounds = int(bw)
+                mp = 2 if (winner_rounds >= wins_to and loser_rounds == 0) else 1
+                stats[red]["match_points"] += mp
+                if mp == 2:
+                    stats[red]["clean_wins"] += 1
+        else:
+            stats[blue]["wins"] += 1
+            stats[red]["losses"] += 1
+            head_to_head[(blue, red)] = 1
+            head_to_head[(red, blue)] = 0
+            if has_scores:
+                winner_rounds = int(bw)
+                loser_rounds = int(rw)
+                mp = 2 if (winner_rounds >= wins_to and loser_rounds == 0) else 1
+                stats[blue]["match_points"] += mp
+                if mp == 2:
+                    stats[blue]["clean_wins"] += 1
+
+    rows = list(stats.values())
+    rows.sort(
+        key=lambda r: (
+            -int(r["wins"]),
+            -int(r.get("match_points") or 0),
+            -int(r.get("clean_wins") or 0),
+            -int(r.get("points") or 0),
+            int(r.get("points_against") or 0),
+            r["athlete_id"],
+        )
+    )
+
+    if len(rows) == 3:
+        w0 = int(rows[0]["wins"])
+        mp0 = int(rows[0].get("match_points") or 0)
+        if all(int(r["wins"]) == w0 and int(r.get("match_points") or 0) == mp0 for r in rows):
+            rows.sort(
+                key=lambda r: (
+                    weight_map.get(r["athlete_id"], 10**9),
+                    r["athlete_id"],
+                )
+            )
+    elif 4 <= len(rows) <= 6:
+        groups: dict[tuple[int, int], list[dict]] = {}
+        for r in rows:
+            key = (int(r["wins"]), int(r.get("match_points") or 0))
+            groups.setdefault(key, []).append(r)
+        for group in groups.values():
+            if len(group) != 2:
+                continue
+            a_id = group[0]["athlete_id"]
+            b_id = group[1]["athlete_id"]
+            h = head_to_head.get((a_id, b_id))
+            if h is None:
+                continue
+            if h == 0:
+                group[0], group[1] = group[1], group[0]
+        ordered: list[dict] = []
+        used = set()
+        for r in rows:
+            if r["athlete_id"] in used:
+                continue
+            key = (int(r["wins"]), int(r.get("match_points") or 0))
+            group = groups.get(key, [r])
+            for g in group:
+                if g["athlete_id"] not in used:
+                    ordered.append(g)
+                    used.add(g["athlete_id"])
+        rows = ordered
+
+    return rows
 
 
 @router.get("/competitions/{comp_id}/categories/{category_id}/standings")
@@ -391,122 +662,9 @@ async def get_round_robin_standings(comp_id: UUID, category_id: UUID):
     )
     bouts = bouts_res.data or []
     done = [b for b in bouts if b.get("status") == "done" and b.get("winner_athlete_id")]
-
-    stats: dict[str, dict] = {}
-    def ensure(a_id: str):
-        if a_id not in stats:
-            stats[a_id] = {
-                "athlete_id": a_id,
-                "wins": 0,
-                "losses": 0,
-                "played": 0,
-                "points": 0,
-                "points_against": 0,
-            }
-
-    head_to_head: dict[tuple[str, str], int] = {}
-
-    for b in done:
-        red = str(b.get("athlete_red_id"))
-        blue = str(b.get("athlete_blue_id"))
-        winner = str(b.get("winner_athlete_id"))
-        if not red or not blue or not winner:
-            continue
-        ensure(red)
-        ensure(blue)
-        stats[red]["played"] += 1
-        stats[blue]["played"] += 1
-        if has_scores:
-            rw = int(b.get("red_wins") or 0)
-            bw = int(b.get("blue_wins") or 0)
-            stats[red]["points"] += rw
-            stats[red]["points_against"] += bw
-            stats[blue]["points"] += bw
-            stats[blue]["points_against"] += rw
-        if winner == red:
-            stats[red]["wins"] += 1
-            stats[blue]["losses"] += 1
-            head_to_head[(red, blue)] = 1
-            head_to_head[(blue, red)] = 0
-        else:
-            stats[blue]["wins"] += 1
-            stats[red]["losses"] += 1
-            head_to_head[(blue, red)] = 1
-            head_to_head[(red, blue)] = 0
-
-    rows = list(stats.values())
-    rows.sort(
-        key=lambda r: (
-            -int(r["wins"]),
-            -int(r.get("points") or 0),
-            int(r.get("points_against") or 0),
-            r["athlete_id"],
-        )
-    )
-
+    weight_map = await _get_weight_map_for_category(db, comp_id_str=comp_id_str, cat_id_str=cat_id_str)
+    rows = _round_robin_rank_from_bouts(bouts=bouts, has_scores=has_scores, weight_map=weight_map)
     athlete_ids = [r["athlete_id"] for r in rows]
-    weight_map: dict[str, float] = {}
-    if athlete_ids:
-        try:
-            apps_res = await _execute(
-                db.table("applications")
-                .select("athlete_id,actual_weight,declared_weight")
-                .eq("competition_id", comp_id_str)
-                .eq("category_id", cat_id_str)
-                .in_("athlete_id", athlete_ids)
-            )
-            for a in (apps_res.data or []):
-                a_id = str(a.get("athlete_id"))
-                w = a.get("actual_weight")
-                if w is None:
-                    w = a.get("declared_weight")
-                if w is None:
-                    continue
-                try:
-                    weight_map[a_id] = float(w)
-                except Exception:
-                    continue
-        except Exception:
-            weight_map = {}
-
-    if len(rows) == 3:
-        w0 = int(rows[0]["wins"])
-        p0 = int(rows[0].get("points") or 0)
-        if all(int(r["wins"]) == w0 and int(r.get("points") or 0) == p0 for r in rows):
-            rows.sort(
-                key=lambda r: (
-                    int(r.get("points_against") or 0),
-                    weight_map.get(r["athlete_id"], 10**9),
-                    r["athlete_id"],
-                )
-            )
-    elif 4 <= len(rows) <= 6:
-        groups: dict[tuple[int, int], list[dict]] = {}
-        for r in rows:
-            key = (int(r["wins"]), int(r.get("points") or 0))
-            groups.setdefault(key, []).append(r)
-        for group in groups.values():
-            if len(group) != 2:
-                continue
-            a_id = group[0]["athlete_id"]
-            b_id = group[1]["athlete_id"]
-            h = head_to_head.get((a_id, b_id))
-            if h is None:
-                continue
-            if h == 0:
-                group[0], group[1] = group[1], group[0]
-        ordered: list[dict] = []
-        used = set()
-        for r in rows:
-            if r["athlete_id"] in used:
-                continue
-            key = (int(r["wins"]), int(r.get("points") or 0))
-            group = groups.get(key, [r])
-            for g in group:
-                if g["athlete_id"] not in used:
-                    ordered.append(g)
-                    used.add(g["athlete_id"])
-        rows = ordered
 
     names = await _get_athlete_name_map(athlete_ids)
     for r in rows:
@@ -532,6 +690,197 @@ async def get_round_robin_standings(comp_id: UUID, category_id: UUID):
         "done_bouts": done_bouts,
         "standings": rows,
         "champion": champion,
+    }
+
+
+def _category_stats_is_in_scope(b: dict) -> bool:
+    if not b.get("athlete_red_id") or not b.get("athlete_blue_id"):
+        return False
+    if str(b.get("athlete_red_id")) == str(b.get("athlete_blue_id")):
+        return False
+    if str(b.get("status") or "") == "cancelled":
+        return False
+    if str(b.get("stage") or "").startswith("withdrawn_"):
+        return False
+    return True
+
+
+def _double_elim_rank_from_bouts(bouts: list[dict]) -> list[dict]:
+    participants: set[str] = set()
+    withdrawn: set[str] = set()
+    for b in bouts:
+        stg = str(b.get("stage") or "")
+        if stg.startswith("withdrawn_"):
+            a = b.get("athlete_red_id")
+            c = b.get("athlete_blue_id")
+            if a:
+                withdrawn.add(str(a))
+            if c:
+                withdrawn.add(str(c))
+    for b in bouts:
+        if not _category_stats_is_in_scope(b):
+            continue
+        a = str(b.get("athlete_red_id") or "")
+        c = str(b.get("athlete_blue_id") or "")
+        if not a or not c:
+            continue
+        if a in withdrawn or c in withdrawn:
+            continue
+        participants.add(a)
+        participants.add(c)
+
+    losses: dict[str, int] = {a: 0 for a in participants}
+    wins: dict[str, int] = {a: 0 for a in participants}
+    played: dict[str, int] = {a: 0 for a in participants}
+    for b in bouts:
+        if not _category_stats_is_in_scope(b):
+            continue
+        if str(b.get("status") or "") != "done":
+            continue
+        a = str(b.get("athlete_red_id") or "")
+        c = str(b.get("athlete_blue_id") or "")
+        if not a or not c or a == c:
+            continue
+        if a not in participants or c not in participants:
+            continue
+        w = str(b.get("winner_athlete_id") or "")
+        if not w:
+            continue
+        played[a] += 1
+        played[c] += 1
+        loser = c if w == a else a
+        losses[loser] = int(losses.get(loser, 0)) + 1
+        wins[w] = int(wins.get(w, 0)) + 1
+
+    rows = []
+    for a in participants:
+        rows.append(
+            {
+                "athlete_id": a,
+                "losses": int(losses.get(a, 0)),
+                "wins": int(wins.get(a, 0)),
+                "played": int(played.get(a, 0)),
+            }
+        )
+    rows.sort(key=lambda r: (int(r["losses"]), -int(r["wins"]), -int(r["played"]), r["athlete_id"]))
+    return rows
+
+
+@router.get("/competitions/{comp_id}/results")
+async def get_competition_results(comp_id: UUID):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    comp_id_str = str(comp_id)
+
+    comp_res = await _execute(
+        admin_supabase.table("competitions").select("id,name,start_date").eq("id", comp_id_str).single()
+    )
+    comp = comp_res.data or {}
+    comp_start = comp.get("start_date")
+
+    cats_res = await _execute(
+        admin_supabase.table("competition_categories")
+        .select("id,gender,age_min,age_max,weight_min,weight_max")
+        .eq("competition_id", comp_id_str)
+        .limit(10000)
+    )
+    categories = {str(c["id"]): c for c in (cats_res.data or []) if c.get("id")}
+
+    bouts_res = await _select_competition_bouts_for_comp(comp_id_str)
+    bouts_all = bouts_res.data or []
+
+    by_cat: dict[str, list[dict]] = {}
+    for b in bouts_all:
+        cat_id = b.get("category_id")
+        if not cat_id:
+            continue
+        by_cat.setdefault(str(cat_id), []).append(b)
+
+    has_scores = await _competition_bouts_has_score_columns()
+
+    categories_out: list[dict] = []
+    champions_out: list[dict] = []
+
+    total_all = 0
+    done_all = 0
+    remaining_all = 0
+
+    for cat_id, bouts in by_cat.items():
+        scoped = [b for b in bouts if _category_stats_is_in_scope(b)]
+        total_bouts = len(scoped)
+        done_bouts = len([b for b in scoped if str(b.get("status") or "") == "done" and b.get("winner_athlete_id")])
+        remaining = len([b for b in scoped if str(b.get("status") or "") in ("queued", "next", "running")])
+
+        total_all += total_bouts
+        done_all += done_bouts
+        remaining_all += remaining
+
+        bracket_types = {str(b.get("bracket_type") or "") for b in scoped if b.get("bracket_type")}
+        bracket_type = sorted(bracket_types)[0] if bracket_types else None
+
+        winners: list[dict] = []
+        is_finished = bool(total_bouts > 0 and done_bouts == total_bouts and remaining == 0)
+
+        if is_finished and bracket_type == "round_robin":
+            weight_map = await _get_weight_map_for_category(
+                admin_supabase, comp_id_str=comp_id_str, cat_id_str=cat_id
+            )
+            ranked = _round_robin_rank_from_bouts(bouts=scoped, has_scores=has_scores, weight_map=weight_map)
+            top = ranked[:3]
+            athlete_ids = [r["athlete_id"] for r in top]
+            names = await _get_athlete_name_map(athlete_ids)
+            for idx, r in enumerate(top, start=1):
+                winners.append({"place": idx, "athlete_id": r["athlete_id"], "name": names.get(r["athlete_id"]) or ""})
+
+        elif is_finished and bracket_type == "double_elim":
+            ranked = _double_elim_rank_from_bouts(scoped)
+            top = ranked[:3]
+            athlete_ids = [r["athlete_id"] for r in top]
+            names = await _get_athlete_name_map(athlete_ids)
+            for idx, r in enumerate(top, start=1):
+                winners.append({"place": idx, "athlete_id": r["athlete_id"], "name": names.get(r["athlete_id"]) or ""})
+
+        label = ""
+        cat = categories.get(cat_id)
+        if cat:
+            label = _category_label(cat, at_date=comp_start)
+
+        cat_out = {
+            "category_id": cat_id,
+            "label": label,
+            "bracket_type": bracket_type,
+            "total_bouts": total_bouts,
+            "done_bouts": done_bouts,
+            "is_finished": is_finished,
+            "winners": winners,
+        }
+        categories_out.append(cat_out)
+
+        if winners:
+            champ = winners[0]
+            champions_out.append(
+                {
+                    "category_id": cat_id,
+                    "category_label": label,
+                    "athlete_id": champ["athlete_id"],
+                    "name": champ.get("name") or "",
+                }
+            )
+
+    categories_out.sort(key=lambda x: x.get("label") or x.get("category_id") or "")
+    champions_out.sort(key=lambda x: x.get("category_label") or x.get("category_id") or "")
+
+    has_started_res = await _execute(
+        admin_supabase.table("competition_bouts").select("id").eq("competition_id", comp_id_str).in_("status", ["running", "done"]).limit(1)
+    )
+    has_started = bool(has_started_res.data)
+    is_finished = bool(has_started and remaining_all == 0 and total_all > 0 and done_all == total_all)
+
+    return {
+        "competition": {"id": comp_id_str, "name": comp.get("name"), "is_finished": is_finished},
+        "totals": {"total_bouts": total_all, "done_bouts": done_all, "remaining_bouts": remaining_all},
+        "categories": categories_out,
+        "champions": champions_out,
     }
 
 
@@ -1131,6 +1480,7 @@ async def _set_next_for_mat(comp_id_str: str, mat_number: int):
         .order("order_in_mat", desc=False)
     )
     rows = res.data or []
+    rows = [r for r in rows if r.get("athlete_red_id") != r.get("athlete_blue_id")]
     running = [r for r in rows if r.get("status") == "running"]
     if running:
         rid = str(running[0]["id"])
@@ -1186,12 +1536,13 @@ async def generate_live_bouts(comp_id: UUID, body: GenerateLiveBoutsRequest):
 
     started_res = await _execute(
         admin_supabase.table("competition_bouts")
-        .select("id")
+        .select("id, athlete_red_id, athlete_blue_id")
         .eq("competition_id", comp_id_str)
         .in_("status", ["running", "done"])
-        .limit(1)
+        .limit(1000)
     )
-    if started_res.data:
+    real_started = [r for r in (started_res.data or []) if r.get("athlete_red_id") != r.get("athlete_blue_id")]
+    if real_started and not body.force_regenerate:
         raise HTTPException(status_code=409, detail="Competition already started. Stop it to reset.")
 
     categories_res = await _execute(
@@ -1357,7 +1708,6 @@ async def generate_live_bouts(comp_id: UUID, body: GenerateLiveBoutsRequest):
                     seq += 1
         else:
             shuffled = list(athlete_ids)
-            random.shuffle(shuffled)
             bye = None
             if len(shuffled) % 2 != 0:
                 bye = shuffled.pop()
@@ -1377,6 +1727,10 @@ async def generate_live_bouts(comp_id: UUID, body: GenerateLiveBoutsRequest):
                     "mat_number": mat_number,
                     "order_in_mat": 0,
                 }
+                if score_cols:
+                    bye_row["red_wins"] = 0
+                    bye_row["blue_wins"] = 0
+                    bye_row["wins_to"] = 2
                 if has_name_cols:
                     bye_row["athlete_red_name"] = name_map.get(bye) or ""
                     bye_row["athlete_blue_name"] = name_map.get(bye) or ""
@@ -1568,23 +1922,44 @@ async def get_live_state(comp_id: UUID):
     )
     mats_rows = mats_res.data or []
 
-    bouts = [b for b in bouts_all if b.get("status") in ("queued", "next", "running")]
-    bouts = await _materialize_names_for_bouts(bouts)
-    has_bouts = bool(bouts)
-    started_res = await _execute(
-        admin_supabase.table("competition_bouts")
-        .select("id")
-        .eq("competition_id", comp_id_str)
-        .in_("status", ["running", "done"])
-        .limit(1)
-    )
-    has_started = bool(started_res.data)
+    active_bouts = [
+        b
+        for b in bouts_all
+        if b.get("status") in ("queued", "next", "running")
+        and b.get("athlete_red_id") != b.get("athlete_blue_id")
+    ]
+    bye_bouts = [
+        b
+        for b in bouts_all
+        if str(b.get("status") or "") == "done"
+        and b.get("athlete_red_id") == b.get("athlete_blue_id")
+        and str(b.get("stage") or "").startswith("bye")
+    ]
+    display_bouts = await _materialize_names_for_bouts(active_bouts + bye_bouts)
+    has_bouts = bool(active_bouts)
+    started_bouts = [
+        b
+        for b in bouts_all
+        if b.get("status") in ("running", "done")
+        and b.get("athlete_red_id") != b.get("athlete_blue_id")
+    ]
+    has_started = bool(started_bouts)
+
+    scoped_all = [b for b in bouts_all if _category_stats_is_in_scope(b)]
+    total_bouts = len(scoped_all)
+    done_bouts = len([b for b in scoped_all if str(b.get("status") or "") == "done" and b.get("winner_athlete_id")])
+    remaining_bouts = len([b for b in scoped_all if str(b.get("status") or "") in ("queued", "next", "running")])
+    is_finished = bool(has_started and total_bouts > 0 and remaining_bouts == 0 and done_bouts == total_bouts)
     bouts_by_mat: dict[int, list[dict]] = {m: [] for m in range(1, mats_count + 1)}
-    for b in bouts:
+    byes_by_mat: dict[int, list[dict]] = {m: [] for m in range(1, mats_count + 1)}
+    for b in display_bouts:
         mat = int(b.get("mat_number") or 0)
         if mat < 1 or mat > mats_count:
             continue
-        bouts_by_mat[mat].append(b)
+        if b.get("athlete_red_id") == b.get("athlete_blue_id") and str(b.get("stage") or "").startswith("bye"):
+            byes_by_mat[mat].append(b)
+        elif str(b.get("status") or "") in ("queued", "next", "running"):
+            bouts_by_mat[mat].append(b)
 
     mats_out = []
     for m in range(1, mats_count + 1):
@@ -1614,6 +1989,12 @@ async def get_live_state(comp_id: UUID):
         pin = [b for b in mat_bouts if str(b.get("id")) in pin_ids]
         rest = [b for b in queue_bouts if str(b.get("id")) not in pin_ids]
         queue_bouts = pin + rest
+        byes_for_mat = byes_by_mat.get(m, [])
+        if rounds_window:
+            byes_for_mat = [b for b in byes_for_mat if int(b.get("round_index") or 0) in rounds_window]
+        byes_for_mat = sorted(byes_for_mat, key=lambda x: (int(x.get("round_index") or 0), int(x.get("order_in_mat") or 0)))
+        if byes_for_mat:
+            queue_bouts = queue_bouts + byes_for_mat
 
         cols_hist = (
             "id,competition_id,category_id,athlete_red_id,athlete_blue_id,bracket_type,round_index,stage,"
@@ -1633,6 +2014,12 @@ async def get_live_state(comp_id: UUID):
             .limit(30)
         )
         history_bouts = await _materialize_names_for_bouts(hist_res.data or [])
+        history_bouts = [
+            b
+            for b in history_bouts
+            if b.get("athlete_red_id") != b.get("athlete_blue_id")
+            and not str(b.get("stage") or "").startswith("bye")
+        ]
 
         mat_current_round = None
         for b in mat_bouts:
@@ -1656,7 +2043,18 @@ async def get_live_state(comp_id: UUID):
         )
 
     return {
-        "competition": {"id": comp_id_str, "name": comp.get("name"), "mats_count": mats_count, "has_bouts": has_bouts, "has_started": has_started},
+        "competition": {
+            "id": comp_id_str,
+            "name": comp.get("name"),
+            "mats_count": mats_count,
+            "has_bouts": has_bouts,
+            "has_started": has_started,
+            "is_finished": is_finished,
+            "total_bouts": total_bouts,
+            "done_bouts": done_bouts,
+            "remaining_bouts": remaining_bouts,
+            "results_path": f"/api/v1/live/competitions/{comp_id_str}/results",
+        },
         "mats": mats_out,
     }
 

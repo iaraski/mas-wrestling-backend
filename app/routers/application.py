@@ -25,10 +25,18 @@ def _applications_open_now() -> bool:
     now = datetime.now(_MSK_TZ)
     return now < _APPLICATION_DEADLINE
 
+def _normalize_gender(g: str | None) -> str:
+    s = (g or "").strip().lower()
+    if s in {"male", "m", "м"}:
+        return "male"
+    if s in {"female", "f", "ж"}:
+        return "female"
+    return s
+
 def _category_group(gender: str | None, age_min: int | None, age_max: int | None) -> str:
-    g = (gender or "").lower()
-    is_male = g == "male" or g == "m"
-    is_female = g == "female" or g == "f"
+    g = _normalize_gender(gender)
+    is_male = g == "male"
+    is_female = g == "female"
     if age_min == 18 and age_max == 21:
         return "Юниоры" if is_male else "Юниорки" if is_female else "Юниоры"
     if age_max is not None and age_max < 18:
@@ -609,8 +617,9 @@ async def admin_apply_athlete_to_category(
     if not passport.get("birth_date") or not passport.get("gender"):
         raise HTTPException(status_code=400, detail="Athlete birth_date and gender are required")
 
-    athlete_gender = str(passport.get("gender"))
-    if str(category.get("gender")) != athlete_gender:
+    athlete_gender = _normalize_gender(str(passport.get("gender")))
+    category_gender = _normalize_gender(str(category.get("gender")))
+    if category_gender != athlete_gender:
         raise HTTPException(status_code=400, detail="Athlete gender does not match category")
 
     def _age_at(birth_date: str, at_date: str | None) -> int:
@@ -620,10 +629,7 @@ async def admin_apply_athlete_to_category(
             at = datetime.fromisoformat(s).date()
         else:
             at = datetime.now(_MSK_TZ).date()
-        age = at.year - b.year
-        if (at.month, at.day) < (b.month, b.day):
-            age -= 1
-        return age
+        return int(at.year) - int(b.year)
 
     age = _age_at(str(passport.get("birth_date")), start_date_str)
     if age < int(category.get("age_min") or 0) or age > int(category.get("age_max") or 200):
