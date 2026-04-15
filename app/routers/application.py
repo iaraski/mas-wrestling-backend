@@ -113,8 +113,14 @@ class AdminCreateAthleteApplication(BaseModel):
     location_id: UUID
     coach_name: str
     birth_date: str
+    gender: Optional[str] = None
+    series: Optional[str] = None
+    number: Optional[str] = None
+    issued_by: Optional[str] = None
+    issue_date: Optional[str] = None
     rank: str
     photo_url: str
+    passport_scan_url: Optional[str] = None
     declared_weight: Optional[float] = None
     actual_weight: Optional[float] = None
 
@@ -128,8 +134,13 @@ class AdminUpdateAthleteProfile(BaseModel):
     coach_name: str
     birth_date: str
     gender: Optional[str] = None
+    series: Optional[str] = None
+    number: Optional[str] = None
+    issued_by: Optional[str] = None
+    issue_date: Optional[str] = None
     rank: str
     photo_url: str
+    passport_scan_url: Optional[str] = None
 
 
 class AdminApplyAthleteToCategory(BaseModel):
@@ -450,24 +461,10 @@ async def create_my_application(
     prof_rows = prof_resp.json()
     prof = prof_rows[0] if isinstance(prof_rows, list) and prof_rows else {}
 
-    pass_resp = await rest_get(
-        "passports",
-        {
-            "select": "birth_date,rank,photo_url,gender",
-            "athlete_id": f"eq.{athlete_id}",
-            "limit": "1",
-        },
-        write=True,
-    )
-    pass_rows = pass_resp.json()
-    passport = pass_rows[0] if isinstance(pass_rows, list) and pass_rows else {}
-
     if not prof.get("full_name") or not prof.get("city") or not prof.get("location_id"):
         raise HTTPException(status_code=400, detail="Fill full_name, city and region")
     if not coach.get("coach_name"):
         raise HTTPException(status_code=400, detail="Fill coach name")
-    if not passport.get("birth_date") or not passport.get("rank") or not passport.get("photo_url") or not passport.get("gender"):
-        raise HTTPException(status_code=400, detail="Fill birth_date, gender, rank and upload photo")
     
     # Check if already applied to this competition (only one application per competition)
     existing_resp = await rest_get(
@@ -553,11 +550,25 @@ async def admin_create_athlete_and_application(
         raise HTTPException(status_code=400, detail="Failed to create athlete")
     athlete_id = str(athlete_rows[0]["id"])
 
-    await rest_upsert(
-        "passports",
-        {"athlete_id": athlete_id, "birth_date": body.birth_date, "rank": body.rank, "photo_url": body.photo_url},
-        on_conflict="athlete_id",
-    )
+    pass_payload: dict[str, object] = {
+        "athlete_id": athlete_id,
+        "birth_date": body.birth_date,
+        "rank": body.rank,
+        "photo_url": body.photo_url,
+    }
+    if body.gender is not None:
+        pass_payload["gender"] = body.gender
+    if body.series is not None:
+        pass_payload["series"] = body.series
+    if body.number is not None:
+        pass_payload["number"] = body.number
+    if body.issued_by is not None:
+        pass_payload["issued_by"] = body.issued_by
+    if body.issue_date is not None:
+        pass_payload["issue_date"] = body.issue_date
+    if body.passport_scan_url is not None:
+        pass_payload["passport_scan_url"] = body.passport_scan_url
+    await rest_upsert("passports", pass_payload, on_conflict="athlete_id")
 
     status = "weighed" if body.actual_weight is not None else "approved"
     app_payload = {
@@ -774,24 +785,41 @@ async def admin_update_athlete_profile(
         prof_payload["phone"] = str(body.phone).strip() or None
     await rest_upsert("profiles", prof_payload, on_conflict="user_id")
     await rest_patch("athletes", {"id": f"eq.{athlete_id}"}, {"coach_name": body.coach_name}, prefer="return=minimal")
-    await rest_upsert(
-        "passports",
-        {
-            "athlete_id": athlete_id,
-            "birth_date": body.birth_date,
-            "gender": body.gender,
-            "rank": body.rank,
-            "photo_url": body.photo_url,
-        },
-        on_conflict="athlete_id",
-    )
+    pass_payload: dict[str, object] = {
+        "athlete_id": athlete_id,
+        "birth_date": body.birth_date,
+        "rank": body.rank,
+        "photo_url": body.photo_url,
+    }
+    if body.gender is not None:
+        pass_payload["gender"] = body.gender
+    if body.series is not None:
+        pass_payload["series"] = body.series
+    if body.number is not None:
+        pass_payload["number"] = body.number
+    if body.issued_by is not None:
+        pass_payload["issued_by"] = body.issued_by
+    if body.issue_date is not None:
+        pass_payload["issue_date"] = body.issue_date
+    if body.passport_scan_url is not None:
+        pass_payload["passport_scan_url"] = body.passport_scan_url
+    await rest_upsert("passports", pass_payload, on_conflict="athlete_id")
 
     return {"ok": True}
 
 @router.patch("/{app_id}/", response_model=Application)
 @router.patch("/{app_id}", response_model=Application)
-async def update_application_status(app_id: UUID, app_update: ApplicationUpdate):
-    # В реальном проекте здесь будет проверка на роль секретаря/админа
+async def update_application_status(
+    app_id: UUID,
+    app_update: ApplicationUpdate,
+    authorization: str | None = Header(default=None),
+):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    requester_id = await _get_user_id_from_bearer(authorization)
+    codes = await _get_role_codes(requester_id)
+    if not _is_staff(codes):
+        raise HTTPException(status_code=403, detail="Forbidden")
     
     # Сначала получим текущую заявку, чтобы знать telegram_id и название соревнования
     # Используем явное имя отношения для athletes -> users
