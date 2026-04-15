@@ -465,6 +465,20 @@ async def create_my_application(
         raise HTTPException(status_code=400, detail="Fill full_name, city and region")
     if not coach.get("coach_name"):
         raise HTTPException(status_code=400, detail="Fill coach name")
+
+    pass_resp = await rest_get(
+        "passports",
+        {
+            "select": "birth_date,rank,photo_url,gender",
+            "athlete_id": f"eq.{athlete_id}",
+            "limit": "1",
+        },
+        write=True,
+    )
+    pass_rows = pass_resp.json()
+    passport = pass_rows[0] if isinstance(pass_rows, list) and pass_rows else {}
+    if not passport.get("birth_date") or not passport.get("rank") or not passport.get("photo_url") or not passport.get("gender"):
+        raise HTTPException(status_code=400, detail="Fill birth_date, gender, rank and upload photo")
     
     # Check if already applied to this competition (only one application per competition)
     existing_resp = await rest_get(

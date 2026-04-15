@@ -887,9 +887,6 @@ async def update_my_details(body: AthleteDetailsUpdate, authorization: str | Non
         raise HTTPException(status_code=500, detail="Service role not configured")
     user_id = await _get_user_id_from_bearer(authorization)
     await _require_can_edit_self(user_id, authorization)
-    role_codes = await _get_my_role_codes(user_id)
-    if not _is_staff_role(role_codes):
-        raise HTTPException(status_code=403, detail="Passport data can only be edited by staff")
     athlete_q = admin_supabase.table("athletes").select("id").eq("user_id", user_id).maybe_single()
     athlete_res = await _execute(athlete_q)
     athlete_data = _safe_data(athlete_res)
@@ -934,11 +931,6 @@ async def submit_my_profile(
     await _require_can_edit_self(user_id, authorization)
     if not rl_allow(f"profile_submit:{user_id}", rate_per_minute=12.0, burst=24.0):
         raise HTTPException(status_code=429, detail="Too many profile submissions, please try again shortly")
-    role_codes = await _get_my_role_codes(user_id)
-    is_staff = _is_staff_role(role_codes)
-    if not is_staff:
-        if (birth_date and str(birth_date).strip()) or (gender and str(gender).strip()) or (rank and str(rank).strip()) or (photo_url and str(photo_url).strip()) or photo:
-            raise HTTPException(status_code=403, detail="Passport data can only be edited by staff")
 
     profile_payload: dict[str, object] = {"user_id": user_id}
     if full_name and full_name.strip():
@@ -982,9 +974,6 @@ async def submit_my_profile(
         if not athlete_row:
             raise HTTPException(status_code=500, detail="Athlete upsert failed")
         athlete_id = str(athlete_row["id"])
-
-    if not is_staff:
-        return {"ok": True}
 
     final_photo_url = str(photo_url).strip() if photo_url else None
     if photo:
@@ -1067,11 +1056,20 @@ async def complete_my_profile(authorization: str | None = Header(default=None)):
     ath_res = await _execute(admin_supabase.table("athletes").select("id,coach_name").eq("user_id", user_id).maybe_single())
     ath = _safe_data(ath_res) or {}
     athlete_id = str(ath.get("id") or "")
+    p_res = await _execute(
+        admin_supabase.table("passports")
+        .select("birth_date,rank,photo_url,gender")
+        .eq("athlete_id", athlete_id)
+        .maybe_single()
+    )
+    p = _safe_data(p_res) or {}
 
     if not prof.get("full_name") or not prof.get("city") or not prof.get("location_id"):
         raise HTTPException(status_code=400, detail="Fill full_name, city and region")
     if not ath.get("coach_name"):
         raise HTTPException(status_code=400, detail="Fill coach name")
+    if not p.get("birth_date") or not p.get("rank") or not p.get("photo_url") or not p.get("gender"):
+        raise HTTPException(status_code=400, detail="Fill birth_date, gender, rank and upload photo")
 
     await _execute(
         admin_supabase.table("registrations").upsert(
