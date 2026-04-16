@@ -578,7 +578,13 @@ def _round_robin_rank_from_bouts(
     has_scores: bool,
     weight_map: dict[str, float],
 ) -> list[dict]:
-    done = [b for b in bouts if b.get("status") == "done" and b.get("winner_athlete_id")]
+    done = [
+        b
+        for b in bouts
+        if b.get("status") == "done"
+        and b.get("winner_athlete_id")
+        and str(b.get("athlete_red_id") or "") != str(b.get("athlete_blue_id") or "")
+    ]
 
     stats: dict[str, dict] = {}
 
@@ -601,6 +607,9 @@ def _round_robin_rank_from_bouts(
         red = str(b.get("athlete_red_id") or "")
         blue = str(b.get("athlete_blue_id") or "")
         winner = str(b.get("winner_athlete_id") or "")
+        stg = str(b.get("stage") or "")
+        if red and blue and red == blue and stg.startswith("bye"):
+            continue
         if not red or not blue or not winner:
             continue
         ensure(red)
@@ -704,7 +713,7 @@ async def get_round_robin_standings(comp_id: UUID, category_id: UUID):
     bouts_res = await _execute(
         db.table("competition_bouts")
         .select(
-            "id,athlete_red_id,athlete_blue_id,winner_athlete_id,status"
+            "id,athlete_red_id,athlete_blue_id,winner_athlete_id,status,stage"
             + (",red_wins,blue_wins,wins_to" if has_scores else "")
         )
         .eq("competition_id", comp_id_str)
@@ -712,7 +721,13 @@ async def get_round_robin_standings(comp_id: UUID, category_id: UUID):
         .eq("bracket_type", "round_robin")
     )
     bouts = bouts_res.data or []
-    done = [b for b in bouts if b.get("status") == "done" and b.get("winner_athlete_id")]
+    done = [
+        b
+        for b in bouts
+        if b.get("status") == "done"
+        and b.get("winner_athlete_id")
+        and str(b.get("athlete_red_id") or "") != str(b.get("athlete_blue_id") or "")
+    ]
     weight_map = await _get_weight_map_for_category(db, comp_id_str=comp_id_str, cat_id_str=cat_id_str)
     rows = _round_robin_rank_from_bouts(bouts=bouts, has_scores=has_scores, weight_map=weight_map)
     athlete_ids = [r["athlete_id"] for r in rows]
@@ -728,6 +743,7 @@ async def get_round_robin_standings(comp_id: UUID, category_id: UUID):
             if b.get("athlete_red_id")
             and b.get("athlete_blue_id")
             and str(b.get("status") or "") != "cancelled"
+            and str(b.get("athlete_red_id") or "") != str(b.get("athlete_blue_id") or "")
             and not str(b.get("stage") or "").startswith("withdrawn_")
         ]
     )
@@ -1192,6 +1208,59 @@ def _round_robin_rounds_with_bye_priority_from_participants(participants: list[s
         participants = [participants[0]] + [participants[-1]] + participants[1:-1]
 
     return rounds
+
+
+def _round_robin_table_rounds(n: int) -> tuple[list[list[tuple[int, int]]], list[int]]:
+    if n <= 1:
+        return ([], [])
+    if n == 2:
+        return ([[(1, 2)]], [])
+    if n == 3:
+        return ([[(1, 2)], [(3, 1)], [(2, 3)]], [3, 2, 1])
+    if n == 4:
+        return ([[(1, 2), (3, 4)], [(1, 3), (2, 4)], [(3, 2), (4, 1)]], [])
+    if n == 5:
+        return (
+            [
+                [(1, 2), (3, 4)],
+                [(5, 1), (2, 3)],
+                [(4, 1), (5, 2)],
+                [(3, 1), (4, 5)],
+                [(2, 4), (3, 5)],
+            ],
+            [5, 4, 3, 2, 1],
+        )
+    if n == 6:
+        return (
+            [
+                [(1, 2), (3, 4), (5, 6)],
+                [(1, 3), (2, 5), (4, 6)],
+                [(1, 4), (2, 6), (3, 5)],
+                [(1, 5), (2, 4), (3, 6)],
+                [(1, 6), (2, 3), (4, 5)],
+            ],
+            [],
+        )
+    raise ValueError("table rounds supported only for n<=6")
+
+
+def _round_robin_rounds_table_small(
+    ordered_ids: list[str],
+) -> tuple[list[list[tuple[str, str]]], list[str]]:
+    n = len(ordered_ids)
+    rounds_tpl, byes_tpl = _round_robin_table_rounds(n)
+    rounds: list[list[tuple[str, str]]] = []
+    byes: list[str] = []
+    for r_idx, pairs in enumerate(rounds_tpl):
+        rr: list[tuple[str, str]] = []
+        for a_pos, b_pos in pairs:
+            a_id = ordered_ids[a_pos - 1]
+            b_id = ordered_ids[b_pos - 1]
+            rr.append((a_id, b_id))
+        rounds.append(rr)
+        if byes_tpl:
+            byes.append(ordered_ids[byes_tpl[r_idx] - 1])
+    return rounds, byes
 
 
 def _best_pairs_avoiding_same_region(athlete_ids: list[str], region_by_athlete: dict[str, str]) -> list[tuple[str, str]]:
@@ -1814,8 +1883,8 @@ async def generate_live_bouts(comp_id: UUID, body: GenerateLiveBoutsRequest):
         score_cols = await _competition_bouts_has_score_columns()
 
         if len(athlete_ids) <= 6:
-            seeded = _seed_round_robin_participants(athlete_ids, region_map)
-            rounds = _round_robin_rounds_with_bye_priority_from_participants(seeded)
+            order = _best_order_avoiding_same_region(athlete_ids, region_map)
+            rounds, byes = _round_robin_rounds_table_small(order)
             for r_idx, matches in enumerate(rounds, start=1):
                 for a_id, b_id in matches:
                     row = {
@@ -1840,6 +1909,31 @@ async def generate_live_bouts(comp_id: UUID, body: GenerateLiveBoutsRequest):
                         row["athlete_blue_name"] = name_map.get(b_id) or ""
                     bouts_to_insert.append(row)
                     sortable_bouts.append((mat_number, int(r_idx), cat_label, seq, row))
+                    seq += 1
+                if byes:
+                    bye_id = byes[r_idx - 1]
+                    bye_row = {
+                        "competition_id": comp_id_str,
+                        "category_id": cat_id,
+                        "athlete_red_id": bye_id,
+                        "athlete_blue_id": bye_id,
+                        "bracket_type": "round_robin",
+                        "round_index": int(r_idx),
+                        "stage": f"bye_rr{int(r_idx)}",
+                        "status": "done",
+                        "winner_athlete_id": bye_id,
+                        "mat_number": mat_number,
+                        "order_in_mat": 0,
+                    }
+                    if score_cols:
+                        bye_row["red_wins"] = 0
+                        bye_row["blue_wins"] = 0
+                        bye_row["wins_to"] = 2
+                    if has_name_cols:
+                        bye_row["athlete_red_name"] = name_map.get(bye_id) or ""
+                        bye_row["athlete_blue_name"] = name_map.get(bye_id) or ""
+                    bouts_to_insert.append(bye_row)
+                    sortable_bouts.append((mat_number, int(r_idx), cat_label, seq, bye_row))
                     seq += 1
         else:
             order = _best_order_avoiding_same_region(athlete_ids, region_map)
@@ -2449,6 +2543,74 @@ async def rollback_mat(comp_id: UUID, body: RollbackMatRequest):
         update["red_wins"] = 0
         update["blue_wins"] = 0
 
+    if not body.to_bout_id and int(body.last_count) <= 0:
+        cats_res = await _execute(
+            admin_supabase.table("competition_bouts")
+            .select("category_id")
+            .eq("competition_id", comp_id_str)
+            .eq("mat_number", mat_number)
+            .eq("bracket_type", "double_elim")
+            .limit(10000)
+        )
+        cat_ids = sorted({str(r.get("category_id") or "") for r in (cats_res.data or []) if r.get("category_id")})
+        if not cat_ids:
+            await _set_next_for_mat(comp_id_str, mat_number)
+            return {"ok": True, "rolled_back": 0, "mat_number": mat_number}
+
+        keep_res = await _execute(
+            admin_supabase.table("competition_bouts")
+            .select("id,stage,round_index,athlete_red_id,athlete_blue_id")
+            .eq("competition_id", comp_id_str)
+            .eq("mat_number", mat_number)
+            .in_("category_id", cat_ids)
+            .limit(10000)
+        )
+        rows = keep_res.data or []
+        to_delete: list[str] = []
+        for r in rows:
+            bid = r.get("id")
+            if not bid:
+                continue
+            stg = str(r.get("stage") or "").lower()
+            if stg.startswith("withdrawn_"):
+                continue
+            rr = int(r.get("round_index") or 0)
+            red = str(r.get("athlete_red_id") or "")
+            blue = str(r.get("athlete_blue_id") or "")
+            is_bye = bool(red and blue and red == blue and stg.startswith("bye"))
+            is_wb1 = (stg == "wb" and rr == 1)
+            is_bye1 = (is_bye and rr == 1)
+            if is_wb1 or is_bye1:
+                continue
+            to_delete.append(str(bid))
+
+        for i in range(0, len(to_delete), 200):
+            chunk = to_delete[i : i + 200]
+            await _execute(
+                admin_supabase.table("competition_mats")
+                .update({"current_bout_id": None})
+                .eq("competition_id", comp_id_str)
+                .in_("current_bout_id", chunk)
+            )
+            await _execute(admin_supabase.table("competition_bouts").delete().in_("id", chunk))
+
+        for i in range(0, len(cat_ids), 100):
+            chunk = cat_ids[i : i + 100]
+            q = (
+                admin_supabase.table("competition_bouts")
+                .update(update)
+                .eq("competition_id", comp_id_str)
+                .eq("mat_number", mat_number)
+                .eq("bracket_type", "double_elim")
+                .eq("stage", "wb")
+                .eq("round_index", 1)
+                .in_("category_id", chunk)
+            )
+            await _execute(q)
+
+        await _set_next_for_mat(comp_id_str, mat_number)
+        return {"ok": True, "rolled_back": -1, "mat_number": mat_number, "reset_to_start": True}
+
     ids_to_rollback: list[str] = []
     rolled_rows: list[dict] = []
     categories_to_cleanup: set[str] = set()
@@ -2467,8 +2629,25 @@ async def rollback_mat(comp_id: UUID, body: RollbackMatRequest):
         if not target:
             raise HTTPException(status_code=404, detail="Target bout not found on this mat")
         if target.get("status") != "done":
-            raise HTTPException(status_code=409, detail="Target bout is not done")
-        target_updated = target.get("updated_at")
+            # UI can send a stale bout id that has already been reset from done to queued.
+            # In this case, fallback to the nearest previous done bout on this mat.
+            target_order = int(target.get("order_in_mat") or 0)
+            fallback_res = await _execute(
+                admin_supabase.table("competition_bouts")
+                .select("id,updated_at")
+                .eq("competition_id", comp_id_str)
+                .eq("mat_number", mat_number)
+                .eq("status", "done")
+                .lte("order_in_mat", target_order)
+                .order("updated_at", desc=True)
+                .limit(1)
+            )
+            fb = (fallback_res.data or [])
+            if not fb:
+                raise HTTPException(status_code=409, detail="Target bout is not done")
+            target_updated = fb[0].get("updated_at")
+        else:
+            target_updated = target.get("updated_at")
         sel = await _execute(
             admin_supabase.table("competition_bouts")
             .select("id,category_id,order_in_mat,athlete_red_id,athlete_blue_id,stage")
