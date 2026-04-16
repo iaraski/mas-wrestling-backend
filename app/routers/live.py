@@ -853,6 +853,24 @@ async def get_competition_results(comp_id: UUID):
     )
     categories = {str(c["id"]): c for c in (cats_res.data or []) if c.get("id")}
 
+    apps_res = await _execute(
+        admin_supabase.table("applications")
+        .select("category_id,athlete_id,status,comment")
+        .eq("competition_id", comp_id_str)
+        .eq("status", "weighed")
+        .limit(100000)
+    )
+    participants_by_cat: dict[str, list[str]] = {}
+    for r in (apps_res.data or []):
+        cat_id = r.get("category_id")
+        athlete_id = r.get("athlete_id")
+        if not cat_id or not athlete_id:
+            continue
+        c = str(r.get("comment") or "")
+        if c.startswith("[WITHDRAWN:"):
+            continue
+        participants_by_cat.setdefault(str(cat_id), []).append(str(athlete_id))
+
     bouts_res = await _select_competition_bouts_for_comp(comp_id_str)
     bouts_all = bouts_res.data or []
 
@@ -872,7 +890,15 @@ async def get_competition_results(comp_id: UUID):
     done_all = 0
     remaining_all = 0
 
-    for cat_id, bouts in by_cat.items():
+    included_cat_ids = set(by_cat.keys())
+    for cat_id, ids in participants_by_cat.items():
+        if ids:
+            included_cat_ids.add(cat_id)
+
+    for cat_id in sorted(included_cat_ids):
+        if cat_id not in categories:
+            continue
+        bouts = by_cat.get(cat_id, [])
         scoped = [b for b in bouts if _category_stats_is_in_scope(b)]
         total_bouts = len(scoped)
         done_bouts = len([b for b in scoped if str(b.get("status") or "") == "done" and b.get("winner_athlete_id")])
@@ -887,6 +913,14 @@ async def get_competition_results(comp_id: UUID):
 
         winners: list[dict] = []
         is_finished = bool(total_bouts > 0 and done_bouts == total_bouts and remaining == 0)
+
+        if total_bouts == 0 and remaining == 0:
+            ids = participants_by_cat.get(cat_id, [])
+            if len(ids) == 1:
+                single_id = ids[0]
+                names = await _get_athlete_name_map([single_id])
+                winners.append({"place": 1, "athlete_id": single_id, "name": names.get(single_id) or ""})
+                is_finished = True
 
         if is_finished and bracket_type == "round_robin":
             weight_map = await _get_weight_map_for_category(
@@ -993,11 +1027,8 @@ async def get_competition_results(comp_id: UUID):
     categories_out.sort(key=lambda x: x.get("label") or x.get("category_id") or "")
     champions_out.sort(key=lambda x: x.get("category_label") or x.get("category_id") or "")
 
-    has_started_res = await _execute(
-        admin_supabase.table("competition_bouts").select("id").eq("competition_id", comp_id_str).in_("status", ["running", "done"]).limit(1)
-    )
-    has_started = bool(has_started_res.data)
-    is_finished = bool(has_started and remaining_all == 0 and total_all > 0 and done_all == total_all)
+    all_cats_finished = bool(categories_out and all(bool(c.get("is_finished")) for c in categories_out))
+    is_finished = bool(all_cats_finished and remaining_all == 0 and done_all == total_all)
 
     return {
         "competition": {"id": comp_id_str, "name": comp.get("name"), "is_finished": is_finished},
