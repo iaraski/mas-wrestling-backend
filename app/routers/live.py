@@ -1,16 +1,21 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel
 from uuid import UUID
 from datetime import datetime
 import anyio
+import csv
+import io
 import os
 import random
+from urllib.parse import quote
 from uuid import uuid4
 
 from app.core.supabase import supabase, admin_supabase
 
 
 router = APIRouter(prefix="/live", tags=["live"])
+
+LIVE_FINALS_MAT_BY_COMP: dict[str, int] = {}
 
 
 class GenerateLiveBoutsRequest(BaseModel):
@@ -88,30 +93,41 @@ def _double_elim_any_round_exists(bouts: list[dict], *, stage: str, round_index:
 async def _append_competition_bouts(
     *,
     comp_id_str: str,
-    mat_number: int,
     rows: list[dict],
 ) -> int:
     if not rows:
         return 0
     if not admin_supabase:
         return 0
-    max_res = await _execute(
-        admin_supabase.table("competition_bouts")
-        .select("order_in_mat")
-        .eq("competition_id", comp_id_str)
-        .eq("mat_number", int(mat_number))
-        .order("order_in_mat", desc=True, nullsfirst=False)
-        .limit(1)
-    )
-    start = int((max_res.data or [{}])[0].get("order_in_mat") or 0)
-    order = start
+
+    by_mat: dict[int, list[dict]] = {}
     for r in rows:
-        order += 1
-        r["order_in_mat"] = order
-        r["mat_number"] = int(mat_number)
-    for i in range(0, len(rows), 200):
-        await _execute(admin_supabase.table("competition_bouts").insert(rows[i : i + 200]))
-    return len(rows)
+        m = int(r.get("mat_number") or 0)
+        if m < 1:
+            continue
+        by_mat.setdefault(m, []).append(r)
+
+    inserted = 0
+    for mat_number, mat_rows in by_mat.items():
+        max_res = await _execute(
+            admin_supabase.table("competition_bouts")
+            .select("order_in_mat")
+            .eq("competition_id", comp_id_str)
+            .eq("mat_number", int(mat_number))
+            .order("order_in_mat", desc=True, nullsfirst=False)
+            .limit(1)
+        )
+        start = int((max_res.data or [{}])[0].get("order_in_mat") or 0)
+        order = start
+        for r in mat_rows:
+            order += 1
+            r["order_in_mat"] = order
+            r["mat_number"] = int(mat_number)
+
+        for i in range(0, len(mat_rows), 200):
+            await _execute(admin_supabase.table("competition_bouts").insert(mat_rows[i : i + 200]))
+        inserted += len(mat_rows)
+    return inserted
 
 
 async def _advance_double_elim_for_category(
@@ -286,6 +302,7 @@ async def _advance_double_elim_for_category(
         return pairs
 
     wb_total = _wb_rounds_total(len(participants))
+    finals_mat = LIVE_FINALS_MAT_BY_COMP.get(comp_id_str)
 
     changed = True
     loops = 0
@@ -523,10 +540,39 @@ async def _advance_double_elim_for_category(
                         forbidden.add(_pair_key(a_id, b_id))
                         changed = True
 
-                emit(old_pool)
-                emit(new_pool)
+                if old_pool and new_pool:
+                    pairs = _best_cross_pairs(old_pool, new_pool, forbidden)
+                    used: set[str] = set()
+                    for a_id, b_id in pairs:
+                        if a_id in used or b_id in used:
+                            continue
+                        add_bout(f"lb{next_lb}", overall, a_id, b_id)
+                        forbidden.add(_pair_key(a_id, b_id))
+                        used.add(a_id)
+                        used.add(b_id)
+                        changed = True
 
-    return await _append_competition_bouts(comp_id_str=comp_id_str, mat_number=mat_number, rows=new_rows)
+                    leftovers = [a for a in old_pool + new_pool if a and a not in used]
+                    emit(leftovers)
+                else:
+                    emit(old_pool)
+                    emit(new_pool)
+
+    if finals_mat and finals_mat > 0 and finals_mat != mat_number:
+        for r in new_rows:
+            if (
+                str(r.get("bracket_type") or "") == "double_elim"
+                and str(r.get("stage") or "") == "wb"
+                and int(r.get("round_index") or 0) == int(wb_total)
+                and str(r.get("status") or "") == "queued"
+                and r.get("athlete_red_id") != r.get("athlete_blue_id")
+            ):
+                r["mat_number"] = int(finals_mat)
+
+    inserted = await _append_competition_bouts(comp_id_str=comp_id_str, rows=new_rows)
+    if finals_mat and finals_mat > 0 and finals_mat != mat_number:
+        await _set_next_for_mat(comp_id_str, int(finals_mat))
+    return inserted
 
 class SeedWeighedApplicationsRequest(BaseModel):
     category_id: UUID
@@ -672,31 +718,33 @@ def _round_robin_rank_from_bouts(
                 )
             )
     elif 4 <= len(rows) <= 6:
-        groups: dict[tuple[int, int], list[dict]] = {}
+        groups_by_wins: dict[int, list[dict]] = {}
         for r in rows:
-            key = (int(r["wins"]), int(r.get("match_points") or 0))
-            groups.setdefault(key, []).append(r)
-        for group in groups.values():
-            if len(group) != 2:
-                continue
-            a_id = group[0]["athlete_id"]
-            b_id = group[1]["athlete_id"]
-            h = head_to_head.get((a_id, b_id))
-            if h is None:
-                continue
-            if h == 0:
-                group[0], group[1] = group[1], group[0]
+            groups_by_wins.setdefault(int(r["wins"]), []).append(r)
+
+        def sort_key(r: dict):
+            return (
+                -int(r.get("match_points") or 0),
+                -int(r.get("clean_wins") or 0),
+                -int(r.get("points") or 0),
+                int(r.get("points_against") or 0),
+                r["athlete_id"],
+            )
+
         ordered: list[dict] = []
-        used = set()
-        for r in rows:
-            if r["athlete_id"] in used:
-                continue
-            key = (int(r["wins"]), int(r.get("match_points") or 0))
-            group = groups.get(key, [r])
-            for g in group:
-                if g["athlete_id"] not in used:
-                    ordered.append(g)
-                    used.add(g["athlete_id"])
+        for wins in sorted(groups_by_wins.keys(), reverse=True):
+            group = groups_by_wins[wins]
+            if len(group) == 2:
+                a_id = group[0]["athlete_id"]
+                b_id = group[1]["athlete_id"]
+                h = head_to_head.get((a_id, b_id))
+                if h is not None:
+                    if h == 1:
+                        ordered.extend([group[0], group[1]])
+                    else:
+                        ordered.extend([group[1], group[0]])
+                    continue
+            ordered.extend(sorted(group, key=sort_key))
         rows = ordered
 
     return rows
@@ -758,6 +806,74 @@ async def get_round_robin_standings(comp_id: UUID, category_id: UUID):
         "standings": rows,
         "champion": champion,
     }
+
+
+@router.get("/competitions/{comp_id}/categories/{category_id}/export.csv")
+async def export_category_csv(comp_id: UUID, category_id: UUID):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+
+    comp_id_str = str(comp_id)
+    cat_id_str = str(category_id)
+
+    comp_res = await _execute(
+        admin_supabase.table("competitions").select("id,start_date").eq("id", comp_id_str).single()
+    )
+    comp = comp_res.data or {}
+
+    cat_res = await _execute(
+        admin_supabase.table("competition_categories")
+        .select("id,gender,age_min,age_max,weight_min,weight_max")
+        .eq("competition_id", comp_id_str)
+        .eq("id", cat_id_str)
+        .single()
+    )
+    cat = cat_res.data
+    if not cat:
+        raise HTTPException(status_code=404, detail="Category not found")
+
+    label = _category_label(cat, at_date=comp.get("start_date"))
+
+    apps_res = await _execute(
+        admin_supabase.table("applications")
+        .select("athlete_id,draw_number,created_at,comment")
+        .eq("competition_id", comp_id_str)
+        .eq("category_id", cat_id_str)
+        .eq("status", "weighed")
+        .limit(100000)
+    )
+    apps = apps_res.data or []
+    filtered = []
+    for r in apps:
+        c = str(r.get("comment") or "")
+        if c.startswith("[WITHDRAWN:"):
+            continue
+        filtered.append(r)
+    filtered.sort(key=lambda r: (int(r.get("draw_number") or 0), str(r.get("created_at") or "")))
+
+    athlete_ids = [str(r.get("athlete_id")) for r in filtered if r.get("athlete_id")]
+    name_map = await _get_athlete_name_map(athlete_ids)
+    region_map = await _get_athlete_region_map(athlete_ids)
+    loc_ids = list({v for v in region_map.values() if v})
+    loc_name_map = await _get_location_name_map(loc_ids)
+
+    out = io.StringIO()
+    out.write("\ufeff")
+    out.write(f"{label}\n")
+    writer = csv.writer(out, delimiter=";", lineterminator="\n")
+    writer.writerow(["№", "Фамилия, имя участника", "Команда"])
+    for idx, a_id in enumerate(athlete_ids, start=1):
+        name = name_map.get(a_id) or a_id
+        reg = region_map.get(a_id) or ""
+        team = loc_name_map.get(reg) or ""
+        writer.writerow([idx, name, team])
+
+    fname = f"{label}.csv"
+    return Response(
+        content=out.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}"},
+    )
 
 
 def _category_stats_is_in_scope(b: dict) -> bool:
@@ -1523,7 +1639,7 @@ async def _get_athlete_name_map(athlete_ids: list[str]) -> dict[str, str]:
         return {}
 
     athletes_res = await _execute(
-        supabase.table("athletes").select("id, user_id").in_("id", athlete_ids)
+        (admin_supabase or supabase).table("athletes").select("id, user_id").in_("id", athlete_ids)
     )
     athletes_rows = athletes_res.data or []
     athlete_to_user: dict[str, str] = {}
@@ -1536,7 +1652,10 @@ async def _get_athlete_name_map(athlete_ids: list[str]) -> dict[str, str]:
             user_ids.append(str(u_id))
 
     profiles_res = await _execute(
-        supabase.table("profiles").select("user_id, full_name").in_("user_id", list(set(user_ids)))
+        (admin_supabase or supabase)
+        .table("profiles")
+        .select("user_id, full_name")
+        .in_("user_id", list(set(user_ids)))
     )
     profiles_rows = profiles_res.data or []
     user_to_name = {str(p["user_id"]): str(p.get("full_name") or "") for p in profiles_rows if p.get("user_id")}
@@ -1546,6 +1665,23 @@ async def _get_athlete_name_map(athlete_ids: list[str]) -> dict[str, str]:
         name = user_to_name.get(u_id) or ""
         athlete_to_name[a_id] = name
     return athlete_to_name
+
+
+async def _get_location_name_map(location_ids: list[str]) -> dict[str, str]:
+    ids = [str(x) for x in location_ids if x]
+    if not ids:
+        return {}
+    db = admin_supabase or supabase
+    out: dict[str, str] = {}
+    for i in range(0, len(ids), 200):
+        chunk = ids[i : i + 200]
+        res = await _execute(db.table("locations").select("id,name").in_("id", chunk))
+        rows = res.data or []
+        for r in rows:
+            lid = r.get("id")
+            if lid:
+                out[str(lid)] = str(r.get("name") or "")
+    return out
 
 
 def _category_label(cat: dict, *, at_date: str | None = None) -> str:
@@ -1768,6 +1904,9 @@ async def generate_live_bouts(comp_id: UUID, body: GenerateLiveBoutsRequest):
     mats_res = await _execute(admin_supabase.table("competitions").select("mats_count,start_date").eq("id", comp_id_str).single())
     mats_count = int((mats_res.data or {}).get("mats_count") or 1)
     comp_start = (mats_res.data or {}).get("start_date")
+
+    if body.finals_mat and 1 <= int(body.finals_mat) <= mats_count:
+        LIVE_FINALS_MAT_BY_COMP[comp_id_str] = int(body.finals_mat)
 
     started_res = await _execute(
         admin_supabase.table("competition_bouts")
@@ -2139,7 +2278,7 @@ async def withdraw_athlete(comp_id: UUID, body: WithdrawAthleteRequest):
 
 
 @router.get("/competitions/{comp_id}/state")
-async def get_live_state(comp_id: UUID):
+async def get_live_state(comp_id: UUID, day: str | None = None):
     if not admin_supabase:
         raise HTTPException(status_code=500, detail="Service role not configured")
     comp_id_str = str(comp_id)
@@ -2151,9 +2290,20 @@ async def get_live_state(comp_id: UUID):
     comp_start = comp.get("start_date")
 
     cats_res = await _execute(
-        admin_supabase.table("competition_categories").select("id,gender,age_min,age_max,weight_min,weight_max").eq("competition_id", comp_id_str)
+        admin_supabase.table("competition_categories")
+        .select("id,gender,age_min,age_max,weight_min,weight_max,competition_day")
+        .eq("competition_id", comp_id_str)
     )
     categories = {str(c["id"]): c for c in (cats_res.data or []) if c.get("id")}
+    days = sorted({str(c.get("competition_day") or "")[:10] for c in categories.values() if c.get("competition_day")})
+    selected_day = str(day or "").strip() or None
+    if selected_day and selected_day not in days:
+        selected_day = None
+    allowed_cat_ids = (
+        {cid for cid, c in categories.items() if str(c.get("competition_day") or "")[:10] == selected_day}
+        if selected_day
+        else None
+    )
 
     assigns_res = await _execute(
         admin_supabase.table("competition_category_assignments").select("category_id,mat_number").eq("competition_id", comp_id_str)
@@ -2162,6 +2312,8 @@ async def get_live_state(comp_id: UUID):
 
     bouts_res = await _select_competition_bouts_for_comp(comp_id_str)
     bouts_all = bouts_res.data or []
+    if allowed_cat_ids is not None:
+        bouts_all = [b for b in bouts_all if str(b.get("category_id") or "") in allowed_cat_ids]
     cats_with_bouts = {str(b.get("category_id")) for b in bouts_all if b.get("category_id")}
 
     cats_by_mat: dict[int, list[dict]] = {m: [] for m in range(1, mats_count + 1)}
@@ -2175,7 +2327,13 @@ async def get_live_state(comp_id: UUID):
         cat = categories.get(cat_id)
         if not cat:
             continue
-        cats_by_mat[mat].append({"id": cat_id, "label": _category_label(cat, at_date=comp_start)})
+        cats_by_mat[mat].append(
+            {
+                "id": cat_id,
+                "label": _category_label(cat, at_date=comp_start),
+                "day": str(cat.get("competition_day") or "")[:10] if cat.get("competition_day") else None,
+            }
+        )
 
     mats_res = await _execute(
         admin_supabase.table("competition_mats").select("mat_number,current_bout_id").eq("competition_id", comp_id_str)
@@ -2196,6 +2354,62 @@ async def get_live_state(comp_id: UUID):
         and str(b.get("stage") or "").startswith("bye")
     ]
     display_bouts = await _materialize_names_for_bouts(active_bouts + bye_bouts)
+    finals_mat = LIVE_FINALS_MAT_BY_COMP.get(comp_id_str)
+    finals_notices_by_mat: dict[int, list[dict]] = {}
+    assigns_by_cat = {str(a.get("category_id") or ""): int(a.get("mat_number") or 0) for a in assigns if a.get("category_id")}
+    if finals_mat and finals_mat > 0:
+        max_wb_round_by_cat: dict[str, int] = {}
+        for b in bouts_all:
+            if str(b.get("bracket_type") or "") != "double_elim":
+                continue
+            s = str(b.get("stage") or "").lower()
+            if s != "wb":
+                continue
+            cat_id = str(b.get("category_id") or "")
+            if not cat_id:
+                continue
+            rr = int(b.get("round_index") or 0)
+            if rr <= 0:
+                continue
+            prev = max_wb_round_by_cat.get(cat_id)
+            if prev is None or rr > prev:
+                max_wb_round_by_cat[cat_id] = rr
+
+        for b in display_bouts:
+            if str(b.get("bracket_type") or "") != "double_elim":
+                continue
+            if str(b.get("stage") or "").lower() != "wb":
+                continue
+            if int(b.get("mat_number") or 0) != int(finals_mat):
+                continue
+            if str(b.get("status") or "") not in ("queued", "next", "running"):
+                continue
+            if b.get("athlete_red_id") == b.get("athlete_blue_id"):
+                continue
+            cat_id = str(b.get("category_id") or "")
+            if not cat_id:
+                continue
+            rr = int(b.get("round_index") or 0)
+            if rr <= 0:
+                continue
+            if rr != int(max_wb_round_by_cat.get(cat_id) or 0):
+                continue
+            src_mat = int(assigns_by_cat.get(cat_id) or 0)
+            if src_mat < 1 or src_mat == int(finals_mat):
+                continue
+            cat = categories.get(cat_id)
+            if not cat:
+                continue
+            finals_notices_by_mat.setdefault(src_mat, []).append(
+                {
+                    "kind": "finals_moved",
+                    "category_id": cat_id,
+                    "label": _category_label(cat, at_date=comp_start),
+                    "to_mat": int(finals_mat),
+                    "athlete_red_name": b.get("athlete_red_name") or "",
+                    "athlete_blue_name": b.get("athlete_blue_name") or "",
+                }
+            )
     has_bouts = bool(active_bouts)
     started_bouts = [
         b
@@ -2299,6 +2513,7 @@ async def get_live_state(comp_id: UUID):
             {
                 "mat_number": m,
                 "categories": sorted(cats_by_mat.get(m, []), key=lambda x: x["label"]),
+                "notices": finals_notices_by_mat.get(m, []),
                 "current_bout": current_bout,
                 "next_bout": next_bout,
                 "queue": queue_bouts,
@@ -2312,6 +2527,9 @@ async def get_live_state(comp_id: UUID):
             "id": comp_id_str,
             "name": comp.get("name"),
             "mats_count": mats_count,
+            "days": days,
+            "selected_day": selected_day,
+            "finals_mat": finals_mat,
             "has_bouts": has_bouts,
             "has_started": has_started,
             "is_finished": is_finished,
