@@ -2219,6 +2219,11 @@ async def get_live_state(comp_id: UUID):
         rest = [b for b in queue_bouts if str(b.get("id")) not in pin_ids]
         queue_bouts = pin + rest
         byes_for_mat = byes_by_mat.get(m, [])
+        active_cat_ids = {str(b.get("category_id") or "") for b in mat_bouts if b.get("category_id")}
+        if active_cat_ids:
+            byes_for_mat = [b for b in byes_for_mat if str(b.get("category_id") or "") in active_cat_ids]
+        else:
+            byes_for_mat = []
         if rounds_window:
             byes_for_mat = [b for b in byes_for_mat if int(b.get("round_index") or 0) in rounds_window]
         byes_for_mat = sorted(byes_for_mat, key=lambda x: (int(x.get("round_index") or 0), int(x.get("order_in_mat") or 0)))
