@@ -150,8 +150,16 @@ class _PGQuery:
         self._params[col] = f"gte.{val}"
         return self
 
+    def gt(self, col: str, val: Any):
+        self._params[col] = f"gt.{val}"
+        return self
+
     def lte(self, col: str, val: Any):
         self._params[col] = f"lte.{val}"
+        return self
+
+    def lt(self, col: str, val: Any):
+        self._params[col] = f"lt.{val}"
         return self
 
     def ilike(self, col: str, pattern: str):
