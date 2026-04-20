@@ -10,8 +10,8 @@ class CategoryBase(BaseModel):
     age_max: int
     weight_min: float
     weight_max: Optional[float] = None
-    competition_day: datetime
-    mandate_day: datetime
+    competition_day: Optional[datetime] = None
+    mandate_day: Optional[datetime] = None
 
 class CategoryCreate(CategoryBase):
     pass
