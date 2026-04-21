@@ -44,6 +44,13 @@ def _jwt_ttl_seconds() -> int:
         return 86400
 
 
+def _jwt_exp_leeway_seconds() -> int:
+    try:
+        return int(os.getenv("AUTH_JWT_EXP_LEEWAY_SECONDS") or "30")
+    except Exception:
+        return 30
+
+
 def issue_access_token(*, user_id: str, email: str | None = None) -> str:
     now = int(time.time())
     payload = {
@@ -94,7 +101,7 @@ def verify_access_token(token: str) -> dict:
         exp_i = int(exp)
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
-    if now >= exp_i:
+    if now >= exp_i + max(0, _jwt_exp_leeway_seconds()):
         raise HTTPException(status_code=401, detail="Token expired")
 
     sub = payload.get("sub")

@@ -121,6 +121,9 @@ celerybeat.pid
 .dmypy.json
 dmypy.json
 
+# ruff
+.ruff_cache/
+
 # Pyre type checker
 .pyre/
 
@@ -141,6 +144,10 @@ docker-compose.dev.yml
 docker-compose.prod.yml
 Dockerfile*
 !Dockerfile
+
+# Test outputs
+test-results/
+coverage/
 
 # System files
 .DS_Store

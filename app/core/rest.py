@@ -1,5 +1,6 @@
 import anyio
 import httpx
+import os
 from typing import Dict, Any, Optional
 from app.core.supabase import SUPABASE_URL, SUPABASE_KEY, SUPABASE_SERVICE_ROLE_KEY
 
@@ -18,11 +19,23 @@ def _headers(write: bool = False) -> Dict[str, str]:
 async def _get_client() -> httpx.AsyncClient:
     global _client
     if _client is None:
+        try:
+            timeout_total = float(os.getenv("SUPABASE_REST_TIMEOUT_SECONDS", "20"))
+        except Exception:
+            timeout_total = 20.0
+        try:
+            timeout_connect = float(os.getenv("SUPABASE_REST_CONNECT_TIMEOUT_SECONDS", "10"))
+        except Exception:
+            timeout_connect = 10.0
+        try:
+            max_retries = int(os.getenv("SUPABASE_REST_TRANSPORT_RETRIES", "1"))
+        except Exception:
+            max_retries = 1
         _client = httpx.AsyncClient(
             http2=False,
-            timeout=httpx.Timeout(20.0, connect=8.0),
-            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20, keepalive_expiry=10.0),
-            transport=httpx.AsyncHTTPTransport(retries=3),
+            timeout=httpx.Timeout(timeout_total, connect=timeout_connect),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20, keepalive_expiry=30.0),
+            transport=httpx.AsyncHTTPTransport(retries=max(0, max_retries)),
         )
     return _client
 
@@ -30,7 +43,12 @@ async def rest_get(path: str, params: Dict[str, Any], *, write: bool = False) ->
     url = f"{_BASE}/{path.lstrip('/')}"
     client = await _get_client()
     last_exc = None
-    for attempt in range(3):
+    try:
+        attempts = int(os.getenv("SUPABASE_REST_ATTEMPTS", "3"))
+    except Exception:
+        attempts = 3
+    attempts = max(1, min(attempts, 5))
+    for attempt in range(attempts):
         try:
             resp = await client.get(url, params=params, headers=_headers(write))
             if resp.status_code >= 500:
@@ -38,9 +56,9 @@ async def rest_get(path: str, params: Dict[str, Any], *, write: bool = False) ->
             return resp
         except Exception as e:
             last_exc = e
-            if attempt >= 2:
+            if attempt >= attempts - 1:
                 break
-            await anyio.sleep(0.2 * (attempt + 1))
+            await anyio.sleep(0.35 * (2**attempt))
     raise RuntimeError(f"REST GET failed: {repr(last_exc)}")
 
 async def rest_post(path: str, params: Dict[str, Any], json: Any, *, prefer: Optional[str] = None) -> httpx.Response:

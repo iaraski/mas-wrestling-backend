@@ -36,18 +36,27 @@ if "/api/v1" in SUPABASE_URL:
     raise ValueError("SUPABASE_URL must be the Supabase project URL (https://<ref>.supabase.co), not the backend API URL")
 
 try:
+    try:
+        http_timeout = float(os.getenv("SUPABASE_HTTP_TIMEOUT_SECONDS", "15"))
+    except Exception:
+        http_timeout = 15.0
+    try:
+        http_retries = int(os.getenv("SUPABASE_HTTP_RETRIES", "1"))
+    except Exception:
+        http_retries = 1
+    http_retries = max(0, min(http_retries, 5))
     # Настраиваем кастомный HTTP-клиент для обхода ошибки SSL: UNEXPECTED_EOF_WHILE_READING
     # Отключаем http2 и жестко ограничиваем время жизни keepalive-соединений
     custom_httpx_client = httpx.Client(
         http2=False,
         limits=httpx.Limits(max_connections=20, max_keepalive_connections=10, keepalive_expiry=10.0),
-        transport=httpx.HTTPTransport(retries=3),
-        timeout=30.0
+        transport=httpx.HTTPTransport(retries=http_retries),
+        timeout=http_timeout
     )
     
     opts = ClientOptions(
         httpx_client=custom_httpx_client,
-        postgrest_client_timeout=30
+        postgrest_client_timeout=int(http_timeout)
     )
     _sdk_supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=opts)
 except Exception as e:
