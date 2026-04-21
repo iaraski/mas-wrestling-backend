@@ -115,6 +115,8 @@ class Application(ApplicationBase):
     created_at: datetime
     updated_at: datetime
     athlete_name: Optional[str] = None
+    athlete_location_id: Optional[UUID] = None
+    athlete_region: Optional[str] = None
     category_description: Optional[str] = None
 
     class Config:

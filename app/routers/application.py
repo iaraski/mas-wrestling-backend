@@ -166,7 +166,7 @@ async def _get_user_id_from_bearer(authorization: str | None) -> str:
 async def get_applications(competition_id: Optional[UUID] = None):
     try:
         params = {
-            "select": "*,competition:competitions(start_date),athletes(users!athletes_user_id_fkey(profiles(full_name))),competition_categories(*)",
+            "select": "*,competition:competitions(start_date),athletes(users!athletes_user_id_fkey(profiles(full_name,location_id,location:locations!profiles_location_id_fkey(name)))),competition_categories(*)",
             "order": "created_at.desc",
             "limit": "10000",
         }
@@ -181,12 +181,24 @@ async def get_applications(competition_id: Optional[UUID] = None):
         apps = []
         for app in rows:
             full_name = "Unknown"
+            athlete_location_id = None
+            athlete_region = None
             try:
                 # athlete -> users -> profiles -> full_name
                 if (app.get("athletes") and 
                     app["athletes"].get("users") and 
                     app["athletes"]["users"].get("profiles")):
-                    full_name = app["athletes"]["users"]["profiles"].get("full_name")
+                    prof = app["athletes"]["users"]["profiles"]
+                    if isinstance(prof, list):
+                        prof = prof[0] if prof else None
+                    if isinstance(prof, dict):
+                        full_name = prof.get("full_name")
+                        athlete_location_id = prof.get("location_id")
+                        loc = prof.get("location")
+                        if isinstance(loc, list):
+                            loc = loc[0] if loc else None
+                        if isinstance(loc, dict):
+                            athlete_region = loc.get("name")
             except Exception as e:
                 print(f"[Applications] Error parsing athlete name for app {app.get('id')}: {e}")
             
@@ -203,6 +215,8 @@ async def get_applications(competition_id: Optional[UUID] = None):
 
             # Добавляем в объект
             app["athlete_name"] = full_name or "Unknown"
+            app["athlete_location_id"] = athlete_location_id
+            app["athlete_region"] = athlete_region
             app["category_description"] = category_desc or "Unknown"
             apps.append(app)
             
