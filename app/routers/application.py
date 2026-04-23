@@ -19,7 +19,7 @@ router = APIRouter(prefix="/applications", tags=["applications"])
 
 _me_cache: dict[str, tuple[float, str]] = {}
 _MSK_TZ = timezone(timedelta(hours=3))
-_APPLICATION_DEADLINE = datetime(2026, 4, 23, 0, 0, tzinfo=_MSK_TZ)
+_APPLICATION_DEADLINE = datetime(2026, 4, 24, 19, 0, tzinfo=_MSK_TZ)
 
 def _applications_open_now() -> bool:
     now = datetime.now(_MSK_TZ)
