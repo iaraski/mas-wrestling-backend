@@ -156,8 +156,8 @@ async def get_me(authorization: str | None = Header(default=None)):
             rows = resp.json()
             if isinstance(rows, list) and rows:
                 res_data = rows[0]
-        except Exception:
-            res_data = None
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Supabase unavailable: {repr(e)}")
 
         role_codes: list[str] = []
         if res_data and res_data.get("user_roles"):
@@ -182,9 +182,11 @@ async def get_me(authorization: str | None = Header(default=None)):
             "role_codes": role_codes,
             "role": primary_role,
         }
-        _me_cache[cache_key] = (time.time() + 30.0, result)
+        _me_cache[cache_key] = (time.time() + 300.0, result)
         return result
-    except HTTPException:
+    except HTTPException as e:
+        if e.status_code in (500, 503):
+            raise
         pass
 
     try:
@@ -218,8 +220,8 @@ async def get_me(authorization: str | None = Header(default=None)):
         rows = resp.json()
         if isinstance(rows, list) and rows:
             res_data = rows[0]
-    except Exception:
-        res_data = None
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Supabase unavailable: {repr(e)}")
 
     role_codes: list[str] = []
     if res_data and res_data.get("user_roles"):
@@ -247,7 +249,7 @@ async def get_me(authorization: str | None = Header(default=None)):
         "role_codes": role_codes,
         "role": primary_role,
     }
-    _me_cache[cache_key] = (time.time() + 30.0, result)
+    _me_cache[cache_key] = (time.time() + 300.0, result)
     return result
 
 

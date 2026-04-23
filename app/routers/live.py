@@ -11,11 +11,13 @@ from urllib.parse import quote
 from uuid import uuid4
 
 from app.core.supabase import supabase, admin_supabase
+from app.core.cache import cache
 
 
 router = APIRouter(prefix="/live", tags=["live"])
 
 LIVE_FINALS_MAT_BY_COMP: dict[str, int] = {}
+_LIVE_STATE_LOCKS: dict[str, anyio.Lock] = {}
 
 
 class GenerateLiveBoutsRequest(BaseModel):
@@ -3607,6 +3609,18 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
     if not admin_supabase:
         raise HTTPException(status_code=500, detail="Service role not configured")
     comp_id_str = str(comp_id)
+    cache_key = f"live_state:v1:{comp_id_str}:{str(day or '').strip()}:{day_index if day_index is not None else ''}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    lock = _LIVE_STATE_LOCKS.get(cache_key)
+    if lock is None:
+        lock = anyio.Lock()
+        _LIVE_STATE_LOCKS[cache_key] = lock
+    async with lock:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
     comp_res = await _execute(
         admin_supabase.table("competitions").select("id,mats_count,name,start_date").eq("id", comp_id_str).single()
     )
@@ -3923,7 +3937,7 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
             }
         )
 
-    return {
+    result = {
         "competition": {
             "id": comp_id_str,
             "name": comp.get("name"),
@@ -3942,6 +3956,8 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
         },
         "mats": mats_out,
     }
+    cache.set(cache_key, result, ttl_seconds=2.0)
+    return result
 
 
 @router.post("/bouts/{bout_id}/start")

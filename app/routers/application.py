@@ -6,7 +6,6 @@ import hashlib
 import time
 from datetime import datetime, timezone, timedelta
 from uuid import UUID, uuid4
-import anyio
 from app.core.supabase import supabase, admin_supabase
 from app.core.rest import rest_get, rest_post, rest_upsert, rest_patch, rest_delete
 from app.core.supabase import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
@@ -176,7 +175,7 @@ async def get_applications(competition_id: Optional[UUID] = None):
         rows = response.json()
         if not isinstance(rows, list):
             rows = []
-        
+
         # Преобразуем данные, чтобы вынести ФИО и описание категории
         apps = []
         for app in rows:
@@ -219,7 +218,6 @@ async def get_applications(competition_id: Optional[UUID] = None):
             app["athlete_region"] = athlete_region
             app["category_description"] = category_desc or "Unknown"
             apps.append(app)
-            
         return apps
     except Exception as e:
         import traceback
