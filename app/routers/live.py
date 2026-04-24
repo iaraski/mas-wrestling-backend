@@ -1256,10 +1256,12 @@ async def export_category_csv(comp_id: UUID, category_id: UUID):
 
     out = io.StringIO()
     out.write("\ufeff")
+    out.write("sep=;\n")
     out.write(f"{label}\n")
     writer = csv.writer(out, delimiter=";", lineterminator="\n")
-    writer.writerow(["№", "Фамилия, имя участника", "Команда"])
-    for idx, a_id in enumerate(athlete_ids, start=1):
+    writer.writerow(["№", "ФИО", "Команда"])
+    for idx, r in enumerate(filtered, start=1):
+        a_id = str(r.get("athlete_id") or "")
         name = name_map.get(a_id) or a_id
         reg = region_map.get(a_id) or ""
         team = loc_name_map.get(reg) or ""
