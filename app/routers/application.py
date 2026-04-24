@@ -1,11 +1,13 @@
-from fastapi import APIRouter, HTTPException, Response, Header
+from fastapi import APIRouter, HTTPException, Response, Header, UploadFile, File
 from pydantic import BaseModel
 from typing import List, Optional
 import random
 import hashlib
 import time
+import os
 from datetime import datetime, timezone, timedelta
 from uuid import UUID, uuid4
+import anyio
 from app.core.supabase import supabase, admin_supabase
 from app.core.rest import rest_get, rest_post, rest_upsert, rest_patch, rest_delete
 from app.core.supabase import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
@@ -256,6 +258,74 @@ async def get_photo_proxy(file_id: str):
             print(f"[Photo Proxy] Error downloading: {e}")
             print(traceback.format_exc())
             raise HTTPException(status_code=500, detail="Error downloading photo")
+
+
+@router.post("/{app_id}/passport/photo")
+async def upload_passport_photo(
+    app_id: UUID,
+    photo: UploadFile = File(...),
+    authorization: str | None = Header(default=None),
+):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    requester_id = await _get_user_id_from_bearer(authorization)
+    codes = await _get_role_codes(requester_id)
+    if not _is_staff(codes):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not photo.content_type or not str(photo.content_type).startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image files are supported")
+    content = await photo.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large (max 10MB)")
+
+    ext = os.path.splitext(photo.filename or "")[1].lower()
+    if not ext:
+        ct = str(photo.content_type or "").lower()
+        if ct == "image/png":
+            ext = ".png"
+        elif ct == "image/webp":
+            ext = ".webp"
+        else:
+            ext = ".jpg"
+
+    app_resp = await rest_get(
+        "applications",
+        {"select": "athlete_id", "id": f"eq.{str(app_id)}", "limit": "1"},
+        write=True,
+    )
+    app_rows = app_resp.json()
+    if not isinstance(app_rows, list) or not app_rows or not app_rows[0].get("athlete_id"):
+        raise HTTPException(status_code=404, detail="Application not found")
+    athlete_id = str(app_rows[0]["athlete_id"])
+
+    object_path = f"documents/{athlete_id}/{uuid4().hex}{ext}"
+    bucket = "avatars"
+
+    def _sync_upload():
+        admin_supabase.storage.from_(bucket).upload(
+            object_path,
+            content,
+            file_options={"content-type": photo.content_type or "application/octet-stream"},
+        )
+
+    upload_exc = None
+    for attempt in range(3):
+        try:
+            await anyio.to_thread.run_sync(_sync_upload)
+            upload_exc = None
+            break
+        except Exception as e:
+            upload_exc = e
+            if attempt >= 2:
+                break
+            await anyio.sleep(0.35 * (attempt + 1))
+    if upload_exc:
+        raise HTTPException(status_code=503, detail=f"Supabase storage unavailable: {type(upload_exc).__name__}")
+
+    return {"ok": True, "photo_url": object_path}
 
 @router.get("/{app_id}/")
 @router.get("/{app_id}")
