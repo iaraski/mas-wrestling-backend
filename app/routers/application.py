@@ -133,14 +133,14 @@ class AdminUpdateAthleteProfile(BaseModel):
     city: str
     location_id: UUID
     coach_name: str
-    birth_date: str
+    birth_date: Optional[str] = None
     gender: Optional[str] = None
     series: Optional[str] = None
     number: Optional[str] = None
     issued_by: Optional[str] = None
     issue_date: Optional[str] = None
-    rank: str
-    photo_url: str
+    rank: Optional[str] = None
+    photo_url: Optional[str] = None
     passport_scan_url: Optional[str] = None
 
 
@@ -881,25 +881,37 @@ async def admin_update_athlete_profile(
         prof_payload["phone"] = str(body.phone).strip() or None
     await rest_upsert("profiles", prof_payload, on_conflict="user_id")
     await rest_patch("athletes", {"id": f"eq.{athlete_id}"}, {"coach_name": body.coach_name}, prefer="return=minimal")
-    pass_payload: dict[str, object] = {
-        "athlete_id": athlete_id,
-        "birth_date": body.birth_date,
-        "rank": body.rank,
-        "photo_url": body.photo_url,
-    }
+    pass_payload: dict[str, object] = {"athlete_id": athlete_id}
+    passport_has_changes = False
+    if body.birth_date is not None:
+        pass_payload["birth_date"] = body.birth_date
+        passport_has_changes = True
+    if body.rank is not None:
+        pass_payload["rank"] = body.rank
+        passport_has_changes = True
+    if body.photo_url is not None:
+        pass_payload["photo_url"] = body.photo_url
+        passport_has_changes = True
     if body.gender is not None:
         pass_payload["gender"] = body.gender
+        passport_has_changes = True
     if body.series is not None:
         pass_payload["series"] = body.series
+        passport_has_changes = True
     if body.number is not None:
         pass_payload["number"] = body.number
+        passport_has_changes = True
     if body.issued_by is not None:
         pass_payload["issued_by"] = body.issued_by
+        passport_has_changes = True
     if body.issue_date is not None:
         pass_payload["issue_date"] = body.issue_date
+        passport_has_changes = True
     if body.passport_scan_url is not None:
         pass_payload["passport_scan_url"] = body.passport_scan_url
-    await rest_upsert("passports", pass_payload, on_conflict="athlete_id")
+        passport_has_changes = True
+    if passport_has_changes:
+        await rest_upsert("passports", pass_payload, on_conflict="athlete_id")
 
     return {"ok": True}
 
