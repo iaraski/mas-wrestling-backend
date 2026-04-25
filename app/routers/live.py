@@ -2269,7 +2269,6 @@ async def _reorder_mat_bouts_by_category_order(
         .select(cols)
         .eq("competition_id", comp_id_str)
         .eq("mat_number", int(mat_number))
-        .in_("status", ["next", "queued"])
         .limit(100000)
     )
     raw = res.data or []
@@ -4209,6 +4208,7 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
     for m in range(1, mats_count + 1):
         mat_bouts = sorted(bouts_by_mat.get(m, []), key=lambda x: int(x.get("order_in_mat") or 0))
         cat_items = cats_by_mat.get(m, []) or []
+        min_order_by_cat_all = min_order_by_mat_cat.get(m) or {}
         min_order_by_cat: dict[str, int] = {}
         for b in mat_bouts:
             cid = str(b.get("category_id") or "")
@@ -4223,7 +4223,10 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
             key=lambda x: (
                 int(x.get("order") or 0)
                 if int(x.get("order") or 0) > 0
-                else min_order_by_cat.get(str(x.get("id") or ""), 10**9),
+                else min_order_by_cat.get(
+                    str(x.get("id") or ""),
+                    min_order_by_cat_all.get(str(x.get("id") or ""), 10**9),
+                ),
                 str(x.get("label") or ""),
             ),
         )
