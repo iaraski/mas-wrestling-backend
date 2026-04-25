@@ -2298,36 +2298,18 @@ async def _reorder_mat_bouts_by_category_order(
     if not rows:
         return 0
 
-    groups: dict[tuple[int, int], list[dict]] = {}
-    for r in rows:
-        key = (int(r["round_index"]), int(r["stage_group_rank"]))
-        groups.setdefault(key, []).append(r)
-
-    group_order = []
-    for (rr, rk), gs in groups.items():
-        min_order = min([int(x.get("order_in_mat") or 0) for x in gs] or [0])
-        group_order.append((rr, rk, min_order, (rr, rk)))
-    group_order.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
-
-    ordered_rows: list[dict] = []
-    for _rr, _rk, _min_order, gkey in group_order:
-        gs = list(groups.get(gkey) or [])
-        gs.sort(key=lambda x: (int(x.get("order_in_mat") or 0), str(x.get("id") or "")))
-
-        by_cat: dict[str, list[dict]] = {}
-        for r in gs:
-            by_cat.setdefault(str(r["category_id"]), []).append(r)
-
-        cat_ids = list(by_cat.keys())
-
-        def _cat_sort_key(cid: str):
-            idx = desired_index.get(cid, 10**9)
-            min_o = min([int(x.get("order_in_mat") or 0) for x in (by_cat.get(cid) or [])] or [0])
-            return (idx, min_o, cid)
-
-        cat_ids.sort(key=_cat_sort_key)
-        for cid in cat_ids:
-            ordered_rows.extend(by_cat.get(cid) or [])
+    # Global deterministic ordering that matches UI expectation:
+    # round -> category order on mat -> bracket stage group -> original order -> id
+    ordered_rows = sorted(
+        rows,
+        key=lambda r: (
+            int(r.get("round_index") or 0),
+            desired_index.get(str(r.get("category_id") or ""), 10**9),
+            int(r.get("stage_group_rank") or 0),
+            int(r.get("order_in_mat") or 0),
+            str(r.get("id") or ""),
+        ),
+    )
 
     payload = [{"id": r["id"], "order_in_mat": i + 1} for i, r in enumerate(ordered_rows)]
     for i in range(0, len(payload), 200):
