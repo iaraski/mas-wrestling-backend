@@ -2124,6 +2124,7 @@ async def _get_mat_category_order(comp_id_str: str, mat_number: int, *, assigned
         res = await _execute(q)
         rows = res.data or []
         items: list[tuple[int, str]] = []
+        has_positive_order = False
         for r in rows:
             cid = str(r.get("category_id") or "")
             if not cid:
@@ -2134,9 +2135,12 @@ async def _get_mat_category_order(comp_id_str: str, mat_number: int, *, assigned
                 ov = int(r.get(order_col) or 0)
             except Exception:
                 ov = 0
+            if ov > 0:
+                has_positive_order = True
             items.append((ov if ov > 0 else 10**9, cid))
-        items.sort(key=lambda x: (x[0], x[1]))
-        return [cid for _o, cid in items]
+        if has_positive_order:
+            items.sort(key=lambda x: (x[0], x[1]))
+            return [cid for _o, cid in items]
 
     # Fallback for schemas without an explicit order column:
     # derive deterministic category order from persisted bout schedule.
