@@ -5597,22 +5597,35 @@ async def reorder_mat_categories(comp_id: UUID, mat_number: int, body: ReorderMa
         }
         assigned_ids = {cid for cid in assigned_ids if cid}
         if assigned_ids:
-            await _ensure_category_assignments(
-                comp_id_str, {cid: int(mat_number) for cid in sorted(assigned_ids)}
-            )
+            try:
+                await _ensure_category_assignments(
+                    comp_id_str, {cid: int(mat_number) for cid in sorted(assigned_ids)}
+                )
+            except Exception:
+                # Some prod schemas may not support assignment upsert/update shape.
+                # Reorder should still work by directly reordering bouts.
+                pass
     if not assigned_ids:
         return {"ok": True, "mat_number": mat_number, "categories": 0, "affected_bouts": 0}
 
     requested = [str(x) for x in body.category_ids]
     requested = [cid for cid in requested if cid in assigned_ids]
 
-    current = await _get_mat_category_order(comp_id_str, int(mat_number), assigned_cat_ids=assigned_ids)
+    try:
+        current = await _get_mat_category_order(comp_id_str, int(mat_number), assigned_cat_ids=assigned_ids)
+    except Exception:
+        current = sorted(assigned_ids)
     current_set = set(current)
     remaining = [cid for cid in current if cid not in set(requested)]
     missing = [cid for cid in sorted(assigned_ids) if cid not in current_set and cid not in set(requested)]
     final_order = list(dict.fromkeys(requested + remaining + missing))
 
-    await _set_mat_category_order(comp_id_str, int(mat_number), final_order)
+    try:
+        await _set_mat_category_order(comp_id_str, int(mat_number), final_order)
+    except Exception:
+        # Non-fatal: if assignments cannot be persisted, keep in-memory fallback and
+        # still reorder actual bouts on mat.
+        LIVE_CATEGORY_ORDER_BY_COMP_MAT[(comp_id_str, int(mat_number))] = list(final_order)
     affected = await _reorder_mat_bouts_by_category_order(
         comp_id_str=comp_id_str, mat_number=int(mat_number), desired_category_ids=final_order
     )
