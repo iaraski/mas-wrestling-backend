@@ -5554,6 +5554,26 @@ async def reorder_mat_categories(comp_id: UUID, mat_number: int, body: ReorderMa
     assigned = [str(r.get("category_id") or "") for r in (assigns_res.data or []) if r.get("category_id")]
     assigned_ids = {cid for cid in assigned if cid}
     if not assigned_ids:
+        # Fallback for environments where assignments were not persisted:
+        # derive mat categories directly from existing bouts.
+        bouts_res = await _execute(
+            admin_supabase.table("competition_bouts")
+            .select("category_id")
+            .eq("competition_id", comp_id_str)
+            .eq("mat_number", int(mat_number))
+            .limit(100000)
+        )
+        assigned_ids = {
+            str(r.get("category_id") or "")
+            for r in (bouts_res.data or [])
+            if r.get("category_id")
+        }
+        assigned_ids = {cid for cid in assigned_ids if cid}
+        if assigned_ids:
+            await _ensure_category_assignments(
+                comp_id_str, {cid: int(mat_number) for cid in sorted(assigned_ids)}
+            )
+    if not assigned_ids:
         return {"ok": True, "mat_number": mat_number, "categories": 0, "affected_bouts": 0}
 
     requested = [str(x) for x in body.category_ids]
