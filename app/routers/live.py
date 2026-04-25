@@ -2311,7 +2311,12 @@ async def _reorder_mat_bouts_by_category_order(
     payload = [{"id": r["id"], "order_in_mat": i + 1} for i, r in enumerate(ordered_rows)]
     for i in range(0, len(payload), 200):
         chunk = payload[i : i + 200]
-        await _execute(admin_supabase.table("competition_bouts").upsert(chunk, on_conflict="id"))
+        for row in chunk:
+            await _execute(
+                admin_supabase.table("competition_bouts")
+                .update({"order_in_mat": int(row["order_in_mat"])})
+                .eq("id", str(row["id"]))
+            )
     await _set_next_for_mat(comp_id_str, int(mat_number))
     return len(payload)
 
