@@ -2147,12 +2147,13 @@ async def _get_mat_category_order(comp_id_str: str, mat_number: int, *, assigned
     if admin_supabase:
         bouts_res = await _execute(
             admin_supabase.table("competition_bouts")
-            .select("category_id,order_in_mat")
+            .select("category_id,order_in_mat,status")
             .eq("competition_id", comp_id_str)
             .eq("mat_number", int(mat_number))
             .limit(100000)
         )
-        min_order_by_cat: dict[str, int] = {}
+        min_order_active_by_cat: dict[str, int] = {}
+        min_order_any_by_cat: dict[str, int] = {}
         for r in (bouts_res.data or []):
             cid = str(r.get("category_id") or "")
             if not cid:
@@ -2163,11 +2164,18 @@ async def _get_mat_category_order(comp_id_str: str, mat_number: int, *, assigned
                 ov = int(r.get("order_in_mat") or 10**9)
             except Exception:
                 ov = 10**9
-            prev = min_order_by_cat.get(cid)
-            if prev is None or ov < prev:
-                min_order_by_cat[cid] = ov
-        if min_order_by_cat:
-            return [cid for cid, _ov in sorted(min_order_by_cat.items(), key=lambda x: (x[1], x[0]))]
+            prev_any = min_order_any_by_cat.get(cid)
+            if prev_any is None or ov < prev_any:
+                min_order_any_by_cat[cid] = ov
+            st = str(r.get("status") or "")
+            if st in ("queued", "next", "running"):
+                prev_active = min_order_active_by_cat.get(cid)
+                if prev_active is None or ov < prev_active:
+                    min_order_active_by_cat[cid] = ov
+        if min_order_active_by_cat:
+            return [cid for cid, _ov in sorted(min_order_active_by_cat.items(), key=lambda x: (x[1], x[0]))]
+        if min_order_any_by_cat:
+            return [cid for cid, _ov in sorted(min_order_any_by_cat.items(), key=lambda x: (x[1], x[0]))]
 
     key = (comp_id_str, int(mat_number))
     base = list(LIVE_CATEGORY_ORDER_BY_COMP_MAT.get(key) or [])
@@ -2213,26 +2221,36 @@ async def _set_mat_category_order(comp_id_str: str, mat_number: int, ordered_cat
     except Exception:
         existing_res = await _execute(
             admin_supabase.table("competition_category_assignments")
-            .select("id,category_id")
+            .select("category_id")
             .eq("competition_id", comp_id_str)
-            .eq("mat_number", int(mat_number))
             .limit(10000)
         )
-        cat_to_row_id = {
-            str(r.get("category_id") or ""): str(r.get("id") or "")
+        existing_cat_ids = {
+            str(r.get("category_id") or "")
             for r in (existing_res.data or [])
-            if r.get("category_id") and r.get("id")
+            if r.get("category_id")
         }
         for row in rows:
             cid = str(row["category_id"])
-            row_id = cat_to_row_id.get(cid)
-            if not row_id:
-                continue
-            await _execute(
-                admin_supabase.table("competition_category_assignments")
-                .update({order_col: int(row[order_col])})
-                .eq("id", row_id)
-            )
+            update_payload = {"mat_number": int(mat_number), order_col: int(row[order_col])}
+            if cid in existing_cat_ids:
+                await _execute(
+                    admin_supabase.table("competition_category_assignments")
+                    .update(update_payload)
+                    .eq("competition_id", comp_id_str)
+                    .eq("category_id", cid)
+                )
+            else:
+                await _execute(
+                    admin_supabase.table("competition_category_assignments").insert(
+                        {
+                            "competition_id": comp_id_str,
+                            "category_id": cid,
+                            "mat_number": int(mat_number),
+                            order_col: int(row[order_col]),
+                        }
+                    )
+                )
 
 
 async def _reorder_mat_bouts_by_category_order(
