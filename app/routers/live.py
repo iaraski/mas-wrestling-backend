@@ -2138,6 +2138,33 @@ async def _get_mat_category_order(comp_id_str: str, mat_number: int, *, assigned
         items.sort(key=lambda x: (x[0], x[1]))
         return [cid for _o, cid in items]
 
+    # Fallback for schemas without an explicit order column:
+    # derive deterministic category order from persisted bout schedule.
+    if admin_supabase:
+        bouts_res = await _execute(
+            admin_supabase.table("competition_bouts")
+            .select("category_id,order_in_mat")
+            .eq("competition_id", comp_id_str)
+            .eq("mat_number", int(mat_number))
+            .limit(100000)
+        )
+        min_order_by_cat: dict[str, int] = {}
+        for r in (bouts_res.data or []):
+            cid = str(r.get("category_id") or "")
+            if not cid:
+                continue
+            if assigned_cat_ids is not None and cid not in assigned_cat_ids:
+                continue
+            try:
+                ov = int(r.get("order_in_mat") or 10**9)
+            except Exception:
+                ov = 10**9
+            prev = min_order_by_cat.get(cid)
+            if prev is None or ov < prev:
+                min_order_by_cat[cid] = ov
+        if min_order_by_cat:
+            return [cid for cid, _ov in sorted(min_order_by_cat.items(), key=lambda x: (x[1], x[0]))]
+
     key = (comp_id_str, int(mat_number))
     base = list(LIVE_CATEGORY_ORDER_BY_COMP_MAT.get(key) or [])
     if assigned_cat_ids is None:
