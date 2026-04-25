@@ -18,7 +18,10 @@ from app.core.local_auth import get_user_id_from_bearer
 router = APIRouter(prefix="/live", tags=["live"])
 
 LIVE_FINALS_MAT_BY_COMP: dict[str, int] = {}
+LIVE_CATEGORY_ORDER_BY_COMP_MAT: dict[tuple[str, int], list[str]] = {}
 _LIVE_STATE_LOCKS: dict[str, anyio.Lock] = {}
+_ASSIGNMENTS_ORDER_COLUMN: str | None = None
+_ASSIGNMENTS_ORDER_COLUMN_CHECKED: bool = False
 
 
 class GenerateLiveBoutsRequest(BaseModel):
@@ -57,6 +60,10 @@ class MoveBoutsRequest(BaseModel):
 
 class FinishBoutRequest(BaseModel):
     winner_athlete_id: UUID
+
+
+class ReorderMatCategoriesRequest(BaseModel):
+    category_ids: list[UUID]
 
 
 def _double_elim_is_lb_stage(stage: str | None) -> bool:
@@ -161,6 +168,10 @@ async def _append_competition_bouts(
         for i in range(0, len(mat_rows), 200):
             await _execute(admin_supabase.table("competition_bouts").insert(mat_rows[i : i + 200]))
         inserted += len(mat_rows)
+        try:
+            await _reorder_mat_bouts_by_category_order(comp_id_str=comp_id_str, mat_number=int(mat_number))
+        except Exception:
+            pass
     return inserted
 
 
@@ -2078,6 +2089,206 @@ async def _ensure_category_assignments(comp_id_str: str, assignments: dict[str, 
             await _execute(admin_supabase.table("competition_category_assignments").insert(row))
 
 
+async def _get_assignments_order_column() -> str | None:
+    global _ASSIGNMENTS_ORDER_COLUMN, _ASSIGNMENTS_ORDER_COLUMN_CHECKED
+    if _ASSIGNMENTS_ORDER_COLUMN_CHECKED:
+        return _ASSIGNMENTS_ORDER_COLUMN
+    if not admin_supabase:
+        _ASSIGNMENTS_ORDER_COLUMN_CHECKED = True
+        _ASSIGNMENTS_ORDER_COLUMN = None
+        return None
+    for col in ("order_in_mat", "order_index", "sort_index", "position"):
+        try:
+            await _execute(admin_supabase.table("competition_category_assignments").select(f"id,{col}").limit(1))
+            _ASSIGNMENTS_ORDER_COLUMN = col
+            _ASSIGNMENTS_ORDER_COLUMN_CHECKED = True
+            return col
+        except Exception:
+            continue
+    _ASSIGNMENTS_ORDER_COLUMN_CHECKED = True
+    _ASSIGNMENTS_ORDER_COLUMN = None
+    return None
+
+
+async def _get_mat_category_order(comp_id_str: str, mat_number: int, *, assigned_cat_ids: set[str] | None = None) -> list[str]:
+    order_col = await _get_assignments_order_column()
+    if order_col and admin_supabase:
+        sel = f"category_id,{order_col}"
+        q = (
+            admin_supabase.table("competition_category_assignments")
+            .select(sel)
+            .eq("competition_id", comp_id_str)
+            .eq("mat_number", int(mat_number))
+            .limit(10000)
+        )
+        res = await _execute(q)
+        rows = res.data or []
+        items: list[tuple[int, str]] = []
+        for r in rows:
+            cid = str(r.get("category_id") or "")
+            if not cid:
+                continue
+            if assigned_cat_ids is not None and cid not in assigned_cat_ids:
+                continue
+            try:
+                ov = int(r.get(order_col) or 0)
+            except Exception:
+                ov = 0
+            items.append((ov if ov > 0 else 10**9, cid))
+        items.sort(key=lambda x: (x[0], x[1]))
+        return [cid for _o, cid in items]
+
+    key = (comp_id_str, int(mat_number))
+    base = list(LIVE_CATEGORY_ORDER_BY_COMP_MAT.get(key) or [])
+    if assigned_cat_ids is None:
+        return base
+    seen = set()
+    out: list[str] = []
+    for cid in base:
+        if cid in assigned_cat_ids and cid not in seen:
+            out.append(cid)
+            seen.add(cid)
+    for cid in sorted([c for c in assigned_cat_ids if c not in seen]):
+        out.append(cid)
+    return out
+
+
+async def _set_mat_category_order(comp_id_str: str, mat_number: int, ordered_cat_ids: list[str]) -> None:
+    ordered = [str(x) for x in ordered_cat_ids if str(x)]
+    key = (comp_id_str, int(mat_number))
+    LIVE_CATEGORY_ORDER_BY_COMP_MAT[key] = ordered
+    order_col = await _get_assignments_order_column()
+    if not order_col or not admin_supabase:
+        return
+
+    rows = []
+    for idx, cid in enumerate(ordered, start=1):
+        rows.append(
+            {
+                "competition_id": comp_id_str,
+                "category_id": cid,
+                "mat_number": int(mat_number),
+                order_col: int(idx),
+            }
+        )
+    if not rows:
+        return
+    try:
+        await _execute(
+            admin_supabase.table("competition_category_assignments").upsert(
+                rows, on_conflict="competition_id,category_id"
+            )
+        )
+    except Exception:
+        existing_res = await _execute(
+            admin_supabase.table("competition_category_assignments")
+            .select("id,category_id")
+            .eq("competition_id", comp_id_str)
+            .eq("mat_number", int(mat_number))
+            .limit(10000)
+        )
+        cat_to_row_id = {
+            str(r.get("category_id") or ""): str(r.get("id") or "")
+            for r in (existing_res.data or [])
+            if r.get("category_id") and r.get("id")
+        }
+        for row in rows:
+            cid = str(row["category_id"])
+            row_id = cat_to_row_id.get(cid)
+            if not row_id:
+                continue
+            await _execute(
+                admin_supabase.table("competition_category_assignments")
+                .update({order_col: int(row[order_col])})
+                .eq("id", row_id)
+            )
+
+
+async def _reorder_mat_bouts_by_category_order(
+    *, comp_id_str: str, mat_number: int, desired_category_ids: list[str] | None = None
+) -> int:
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    desired = [str(x) for x in (desired_category_ids or []) if str(x)]
+    if not desired:
+        desired = await _get_mat_category_order(comp_id_str, int(mat_number))
+    desired_index = {cid: idx for idx, cid in enumerate(desired)}
+
+    cols = "id,category_id,round_index,bracket_type,stage,order_in_mat,status"
+    res = await _execute(
+        admin_supabase.table("competition_bouts")
+        .select(cols)
+        .eq("competition_id", comp_id_str)
+        .eq("mat_number", int(mat_number))
+        .in_("status", ["next", "queued"])
+        .limit(100000)
+    )
+    raw = res.data or []
+    rows = []
+    for b in raw:
+        bid = str(b.get("id") or "")
+        cid = str(b.get("category_id") or "")
+        if not bid or not cid:
+            continue
+        try:
+            rr = int(b.get("round_index") or 0)
+        except Exception:
+            rr = 0
+        try:
+            oi = int(b.get("order_in_mat") or 0)
+        except Exception:
+            oi = 0
+        rows.append(
+            {
+                "id": bid,
+                "category_id": cid,
+                "round_index": rr,
+                "stage_group_rank": _stage_group_rank(bracket_type=b.get("bracket_type"), stage=b.get("stage")),
+                "order_in_mat": oi,
+            }
+        )
+    if not rows:
+        return 0
+
+    groups: dict[tuple[int, int], list[dict]] = {}
+    for r in rows:
+        key = (int(r["round_index"]), int(r["stage_group_rank"]))
+        groups.setdefault(key, []).append(r)
+
+    group_order = []
+    for (rr, rk), gs in groups.items():
+        min_order = min([int(x.get("order_in_mat") or 0) for x in gs] or [0])
+        group_order.append((rr, rk, min_order, (rr, rk)))
+    group_order.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+
+    ordered_rows: list[dict] = []
+    for _rr, _rk, _min_order, gkey in group_order:
+        gs = list(groups.get(gkey) or [])
+        gs.sort(key=lambda x: (int(x.get("order_in_mat") or 0), str(x.get("id") or "")))
+
+        by_cat: dict[str, list[dict]] = {}
+        for r in gs:
+            by_cat.setdefault(str(r["category_id"]), []).append(r)
+
+        cat_ids = list(by_cat.keys())
+
+        def _cat_sort_key(cid: str):
+            idx = desired_index.get(cid, 10**9)
+            min_o = min([int(x.get("order_in_mat") or 0) for x in (by_cat.get(cid) or [])] or [0])
+            return (idx, min_o, cid)
+
+        cat_ids.sort(key=_cat_sort_key)
+        for cid in cat_ids:
+            ordered_rows.extend(by_cat.get(cid) or [])
+
+    payload = [{"id": r["id"], "order_in_mat": i + 1} for i, r in enumerate(ordered_rows)]
+    for i in range(0, len(payload), 200):
+        chunk = payload[i : i + 200]
+        await _execute(admin_supabase.table("competition_bouts").upsert(chunk, on_conflict="id"))
+    await _set_next_for_mat(comp_id_str, int(mat_number))
+    return len(payload)
+
+
 async def _ensure_competition_mats(comp_id_str: str, mats_count: int) -> None:
     global _mats_supports_comp_mat_upsert
     if not admin_supabase:
@@ -2966,16 +3177,33 @@ async def _set_next_for_mat(comp_id_str: str, mat_number: int):
 
     res = await _execute(
         admin_supabase.table("competition_bouts")
-        .select("id,status,order_in_mat,round_index,bracket_type,stage,athlete_red_id,athlete_blue_id")
+        .select("id,status,order_in_mat,round_index,category_id,bracket_type,stage,athlete_red_id,athlete_blue_id")
         .eq("competition_id", comp_id_str)
         .eq("mat_number", mat_number)
         .in_("status", ["queued", "next", "running"])
     )
     rows = res.data or []
     rows = [r for r in rows if r.get("athlete_red_id") != r.get("athlete_blue_id")]
+    cat_order = await _get_mat_category_order(comp_id_str, int(mat_number))
+    cat_index = {cid: idx for idx, cid in enumerate([str(x) for x in cat_order if str(x)])}
+    if not cat_index:
+        # Fallback: if explicit category ordering is unavailable, derive stable order
+        # from the first appearance in mat schedule (order_in_mat).
+        min_order_by_cat: dict[str, int] = {}
+        for r in rows:
+            cid = str(r.get("category_id") or "")
+            if not cid:
+                continue
+            ov = int(r.get("order_in_mat") or 10**9)
+            prev = min_order_by_cat.get(cid)
+            if prev is None or ov < prev:
+                min_order_by_cat[cid] = ov
+        derived = sorted(min_order_by_cat.items(), key=lambda x: (x[1], x[0]))
+        cat_index = {cid: idx for idx, (cid, _ov) in enumerate(derived)}
     rows.sort(
         key=lambda r: (
             int(r.get("round_index") or 0),
+            cat_index.get(str(r.get("category_id") or ""), 10**9),
             _stage_group_rank(bracket_type=r.get("bracket_type"), stage=r.get("stage")),
             int(r.get("order_in_mat") or 0),
         )
@@ -3204,6 +3432,17 @@ async def generate_live_bouts(comp_id: UUID, body: GenerateLiveBoutsRequest):
     sortable_bouts: list[tuple[int, int, str, int, dict]] = []
     cat_label_by_id = {str(c["id"]): _category_label(c, at_date=comp_start) for c in active_categories if c.get("id")}
     seq = 0
+    cats_for_order_by_mat: dict[int, list[tuple[str, str]]] = {}
+    for cat in active_categories:
+        cat_id = str(cat.get("id") or "")
+        if not cat_id:
+            continue
+        mat_number = int(assignments.get(cat_id) or 1)
+        label = cat_label_by_id.get(cat_id) or cat_id
+        cats_for_order_by_mat.setdefault(mat_number, []).append((label, cat_id))
+    for m, items in cats_for_order_by_mat.items():
+        items.sort(key=lambda x: x[0])
+        await _set_mat_category_order(comp_id_str, int(m), [cid for _lbl, cid in items])
 
     for cat in active_categories:
         cat_id = str(cat["id"])
@@ -3681,10 +3920,20 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
         else None
     )
 
+    order_col = await _get_assignments_order_column()
+    assigns_sel = "category_id,mat_number"
+    if order_col:
+        assigns_sel += f",{order_col}"
     assigns_res = await _execute(
-        admin_supabase.table("competition_category_assignments").select("category_id,mat_number").eq("competition_id", comp_id_str)
+        admin_supabase.table("competition_category_assignments").select(assigns_sel).eq("competition_id", comp_id_str)
     )
     assigns = assigns_res.data or []
+    mem_index_by_mat: dict[int, dict[str, int]] = {}
+    if not order_col:
+        for m in range(1, mats_count + 1):
+            key = (comp_id_str, int(m))
+            lst = LIVE_CATEGORY_ORDER_BY_COMP_MAT.get(key) or []
+            mem_index_by_mat[m] = {str(cid): idx + 1 for idx, cid in enumerate(lst) if str(cid)}
 
     apps_res = await _execute(
         admin_supabase.table("applications")
@@ -3711,6 +3960,7 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
     cats_with_bouts = {str(b.get("category_id")) for b in bouts_all if b.get("category_id")}
 
     cats_by_mat: dict[int, list[dict]] = {m: [] for m in range(1, mats_count + 1)}
+    seen_cats_by_mat: dict[int, set[str]] = {m: set() for m in range(1, mats_count + 1)}
     for a in assigns:
         cat_id = str(a.get("category_id") or "")
         mat = int(a.get("mat_number") or 0)
@@ -3721,13 +3971,73 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
         cat = categories.get(cat_id)
         if not cat:
             continue
+        order_val = 0
+        if order_col:
+            try:
+                order_val = int(a.get(order_col) or 0)
+            except Exception:
+                order_val = 0
+        else:
+            order_val = int((mem_index_by_mat.get(mat) or {}).get(cat_id) or 0)
         cats_by_mat[mat].append(
             {
                 "id": cat_id,
                 "label": _category_label(cat, at_date=comp_start),
                 "day": str(cat.get("competition_day") or "")[:10] if cat.get("competition_day") else None,
+                "order": order_val,
             }
         )
+        if cat_id:
+            seen_cats_by_mat.setdefault(mat, set()).add(cat_id)
+
+    min_order_by_mat_cat: dict[int, dict[str, int]] = {}
+    for b in bouts_all:
+        mat = int(b.get("mat_number") or 0)
+        if mat < 1 or mat > mats_count:
+            continue
+        cat_id = str(b.get("category_id") or "")
+        if not cat_id or cat_id not in categories:
+            continue
+        try:
+            oi = int(b.get("order_in_mat") or 0)
+        except Exception:
+            oi = 0
+        if oi <= 0:
+            continue
+        d = min_order_by_mat_cat.get(mat)
+        if d is None:
+            d = {}
+            min_order_by_mat_cat[mat] = d
+        prev = d.get(cat_id)
+        if prev is None or oi < prev:
+            d[cat_id] = oi
+
+    for m in range(1, mats_count + 1):
+        present = {str(b.get("category_id") or "") for b in bouts_all if int(b.get("mat_number") or 0) == m}
+        present = {c for c in present if c and c in categories}
+        if not present:
+            continue
+        seen = seen_cats_by_mat.get(m) or set()
+        missing = [cid for cid in present if cid not in seen]
+        if not missing:
+            continue
+        for cid in sorted(missing):
+            cat = categories.get(cid)
+            if not cat:
+                continue
+            order_val = int((mem_index_by_mat.get(m) or {}).get(cid) or 0)
+            if order_val <= 0:
+                order_val = int((min_order_by_mat_cat.get(m) or {}).get(cid) or 0)
+            cats_by_mat[m].append(
+                {
+                    "id": cid,
+                    "label": _category_label(cat, at_date=comp_start),
+                    "day": str(cat.get("competition_day") or "")[:10] if cat.get("competition_day") else None,
+                    "order": order_val,
+                }
+            )
+            seen.add(cid)
+        seen_cats_by_mat[m] = seen
 
     mats_res = await _execute(
         admin_supabase.table("competition_mats").select("mat_number,current_bout_id").eq("competition_id", comp_id_str)
@@ -3844,6 +4154,26 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
     mats_out = []
     for m in range(1, mats_count + 1):
         mat_bouts = sorted(bouts_by_mat.get(m, []), key=lambda x: int(x.get("order_in_mat") or 0))
+        cat_items = cats_by_mat.get(m, []) or []
+        min_order_by_cat: dict[str, int] = {}
+        for b in mat_bouts:
+            cid = str(b.get("category_id") or "")
+            if not cid:
+                continue
+            ov = int(b.get("order_in_mat") or 10**9)
+            prev = min_order_by_cat.get(cid)
+            if prev is None or ov < prev:
+                min_order_by_cat[cid] = ov
+        cat_items_sorted = sorted(
+            cat_items,
+            key=lambda x: (
+                int(x.get("order") or 0)
+                if int(x.get("order") or 0) > 0
+                else min_order_by_cat.get(str(x.get("id") or ""), 10**9),
+                str(x.get("label") or ""),
+            ),
+        )
+        cat_index = {str(x.get("id") or ""): idx for idx, x in enumerate(cat_items_sorted) if x.get("id")}
         running_bout = next((b for b in mat_bouts if b.get("status") == "running"), None)
         next_marked = next((b for b in mat_bouts if b.get("status") == "next"), None)
         current_bout = running_bout or next_marked
@@ -3860,6 +4190,7 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
                 candidates.sort(
                     key=lambda r: (
                         int(r.get("round_index") or 0),
+                        cat_index.get(str(r.get("category_id") or ""), 10**9),
                         _stage_group_rank(bracket_type=r.get("bracket_type"), stage=r.get("stage")),
                         int(r.get("order_in_mat") or 0),
                     )
@@ -3875,6 +4206,7 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
                 candidates.sort(
                     key=lambda r: (
                         int(r.get("round_index") or 0),
+                        cat_index.get(str(r.get("category_id") or ""), 10**9),
                         _stage_group_rank(bracket_type=r.get("bracket_type"), stage=r.get("stage")),
                         int(r.get("order_in_mat") or 0),
                     )
@@ -3943,7 +4275,13 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
         mats_out.append(
             {
                 "mat_number": m,
-                "categories": sorted(cats_by_mat.get(m, []), key=lambda x: x["label"]),
+                "categories": sorted(
+                    cats_by_mat.get(m, []),
+                    key=lambda x: (
+                        int(x.get("order") or 0) if int(x.get("order") or 0) > 0 else 10**9,
+                        str(x.get("label") or ""),
+                    ),
+                ),
                 "notices": finals_notices_by_mat.get(m, []),
                 "current_bout": current_bout,
                 "next_bout": next_bout,
@@ -4004,7 +4342,18 @@ async def start_bout(bout_id: UUID):
     if running_res.data and str(running_res.data[0]["id"]) != bout_id_str:
         raise HTTPException(status_code=409, detail="Another bout is already running on this mat")
 
-    if bout.get("status") not in ("next", "queued"):
+    bout_status = str(bout.get("status") or "")
+    if bout_status == "running":
+        await _execute(
+            admin_supabase.table("competition_mats")
+            .update({"current_bout_id": bout_id_str})
+            .eq("competition_id", comp_id_str)
+            .eq("mat_number", mat_number)
+        )
+        return {"ok": True, "bout_id": bout_id_str, "status": "running"}
+    if bout_status not in ("next", "queued"):
+        if bout_status == "done":
+            raise HTTPException(status_code=409, detail="Bout is already finished")
         raise HTTPException(status_code=409, detail="Bout is not ready to start")
 
     await _execute(
@@ -4299,16 +4648,18 @@ async def rollback_mat(comp_id: UUID, body: RollbackMatRequest):
         update["blue_wins"] = 0
 
     if not body.to_bout_id and int(body.last_count) <= 0:
-        rr_res = await _execute(
+        all_res = await _execute(
             admin_supabase.table("competition_bouts")
-            .select("id,stage,athlete_red_id,athlete_blue_id")
+            .select("id,category_id,bracket_type,stage,round_index,athlete_red_id,athlete_blue_id")
             .eq("competition_id", comp_id_str)
             .eq("mat_number", mat_number)
-            .eq("bracket_type", "round_robin")
-            .limit(10000)
+            .limit(100000)
         )
-        rr_rows = rr_res.data or []
+        all_rows = all_res.data or []
+
+        rr_rows = [r for r in all_rows if str(r.get("bracket_type") or "") == "round_robin"]
         rr_to_reset: list[str] = []
+        rr_athlete_ids: set[str] = set()
         for r in rr_rows:
             bid = r.get("id")
             if not bid:
@@ -4318,101 +4669,129 @@ async def rollback_mat(comp_id: UUID, body: RollbackMatRequest):
                 continue
             red = str(r.get("athlete_red_id") or "")
             blue = str(r.get("athlete_blue_id") or "")
-            is_bye = bool(red and blue and red == blue)
-            if is_bye or stg.startswith("bye"):
-                continue
-            rr_to_reset.append(str(bid))
+            is_bye = bool(red and blue and red == blue) or stg.startswith("bye")
+            if not is_bye:
+                rr_to_reset.append(str(bid))
+            if red and blue and red != blue:
+                rr_athlete_ids.add(red)
+                rr_athlete_ids.add(blue)
 
         if rr_to_reset:
             for i in range(0, len(rr_to_reset), 200):
                 chunk = rr_to_reset[i : i + 200]
                 await _execute(admin_supabase.table("competition_bouts").update(update).in_("id", chunk))
-            rr_athlete_ids: set[str] = set()
-            for r in rr_rows:
+        if rr_athlete_ids:
+            await _clear_withdrawn_markers_for_athletes(comp_id_str, rr_athlete_ids)
+        await _ensure_round_robin_bouts_small_for_mat(comp_id_str, mat_number)
+
+        de_cat_ids = sorted(
+            {
+                str(r.get("category_id") or "")
+                for r in all_rows
+                if str(r.get("bracket_type") or "") == "double_elim" and r.get("category_id")
+            }
+        )
+        finals_mats: set[int] = set()
+        if de_cat_ids:
+            to_delete: list[str] = []
+            for r in all_rows:
+                if str(r.get("bracket_type") or "") != "double_elim":
+                    continue
+                cat_id = str(r.get("category_id") or "")
+                if not cat_id or cat_id not in set(de_cat_ids):
+                    continue
+                bid = r.get("id")
+                if not bid:
+                    continue
                 stg = str(r.get("stage") or "").lower()
                 if stg.startswith("withdrawn_"):
                     continue
+                rr = int(r.get("round_index") or 0)
                 red = str(r.get("athlete_red_id") or "")
                 blue = str(r.get("athlete_blue_id") or "")
-                if red and blue and red != blue:
-                    rr_athlete_ids.add(red)
-                    rr_athlete_ids.add(blue)
-            await _clear_withdrawn_markers_for_athletes(comp_id_str, rr_athlete_ids)
-            await _ensure_round_robin_bouts_small_for_mat(comp_id_str, mat_number)
-            await _execute(
-                admin_supabase.table("competition_mats")
-                .update({"current_bout_id": None})
-                .eq("competition_id", comp_id_str)
-                .eq("mat_number", mat_number)
+                is_bye = bool(red and blue and red == blue and stg.startswith("bye"))
+                is_wb1 = (stg == "wb" and rr == 1)
+                is_bye1 = (is_bye and rr == 1)
+                if is_wb1 or is_bye1:
+                    continue
+                to_delete.append(str(bid))
+
+            for i in range(0, len(to_delete), 200):
+                chunk = to_delete[i : i + 200]
+                await _execute(
+                    admin_supabase.table("competition_mats")
+                    .update({"current_bout_id": None})
+                    .eq("competition_id", comp_id_str)
+                    .in_("current_bout_id", chunk)
+                )
+                await _execute(admin_supabase.table("competition_bouts").delete().in_("id", chunk))
+
+            for i in range(0, len(de_cat_ids), 100):
+                chunk = de_cat_ids[i : i + 100]
+                q = (
+                    admin_supabase.table("competition_bouts")
+                    .update(update)
+                    .eq("competition_id", comp_id_str)
+                    .eq("mat_number", mat_number)
+                    .eq("bracket_type", "double_elim")
+                    .eq("stage", "wb")
+                    .eq("round_index", 1)
+                    .in_("category_id", chunk)
+                )
+                await _execute(q)
+
+            finals_mats = await _delete_final_bouts_for_categories(
+                comp_id_str=comp_id_str, category_ids=set(de_cat_ids)
             )
-            await _set_next_for_mat(comp_id_str, mat_number)
-            return {"ok": True, "rolled_back": -1, "mat_number": mat_number, "reset_to_start": True}
 
-        cats_res = await _execute(
+        after_res = await _execute(
             admin_supabase.table("competition_bouts")
-            .select("category_id")
+            .select("id,stage,athlete_red_id,athlete_blue_id")
             .eq("competition_id", comp_id_str)
             .eq("mat_number", mat_number)
-            .eq("bracket_type", "double_elim")
-            .limit(10000)
+            .limit(100000)
         )
-        cat_ids = sorted({str(r.get("category_id") or "") for r in (cats_res.data or []) if r.get("category_id")})
-        if not cat_ids:
-            await _set_next_for_mat(comp_id_str, mat_number)
-            return {"ok": True, "rolled_back": 0, "mat_number": mat_number}
-
-        keep_res = await _execute(
-            admin_supabase.table("competition_bouts")
-            .select("id,stage,round_index,athlete_red_id,athlete_blue_id")
-            .eq("competition_id", comp_id_str)
-            .eq("mat_number", mat_number)
-            .in_("category_id", cat_ids)
-            .limit(10000)
-        )
-        rows = keep_res.data or []
-        to_delete: list[str] = []
-        for r in rows:
+        after_rows = after_res.data or []
+        to_queued: list[str] = []
+        to_done: list[tuple[str, str]] = []
+        for r in after_rows:
             bid = r.get("id")
             if not bid:
                 continue
             stg = str(r.get("stage") or "").lower()
             if stg.startswith("withdrawn_"):
                 continue
-            rr = int(r.get("round_index") or 0)
             red = str(r.get("athlete_red_id") or "")
             blue = str(r.get("athlete_blue_id") or "")
-            is_bye = bool(red and blue and red == blue and stg.startswith("bye"))
-            is_wb1 = (stg == "wb" and rr == 1)
-            is_bye1 = (is_bye and rr == 1)
-            if is_wb1 or is_bye1:
+            is_bye = bool(red and blue and red == blue) or stg.startswith("bye")
+            if is_bye:
+                if red:
+                    to_done.append((str(bid), red))
                 continue
-            to_delete.append(str(bid))
+            to_queued.append(str(bid))
 
-        for i in range(0, len(to_delete), 200):
-            chunk = to_delete[i : i + 200]
-            await _execute(
-                admin_supabase.table("competition_mats")
-                .update({"current_bout_id": None})
-                .eq("competition_id", comp_id_str)
-                .in_("current_bout_id", chunk)
-            )
-            await _execute(admin_supabase.table("competition_bouts").delete().in_("id", chunk))
+        if to_queued:
+            for i in range(0, len(to_queued), 200):
+                chunk = to_queued[i : i + 200]
+                await _execute(admin_supabase.table("competition_bouts").update(update).in_("id", chunk))
+        if to_done:
+            for i in range(0, len(to_done), 200):
+                chunk = to_done[i : i + 200]
+                ids = [x[0] for x in chunk]
+                await _execute(admin_supabase.table("competition_bouts").update({"status": "done"}).in_("id", ids))
+                for bid, winner_id in chunk:
+                    upd = {"winner_athlete_id": winner_id}
+                    if has_scores:
+                        upd["red_wins"] = 0
+                        upd["blue_wins"] = 0
+                    await _execute(admin_supabase.table("competition_bouts").update(upd).eq("id", bid))
 
-        for i in range(0, len(cat_ids), 100):
-            chunk = cat_ids[i : i + 100]
-            q = (
-                admin_supabase.table("competition_bouts")
-                .update(update)
-                .eq("competition_id", comp_id_str)
-                .eq("mat_number", mat_number)
-                .eq("bracket_type", "double_elim")
-                .eq("stage", "wb")
-                .eq("round_index", 1)
-                .in_("category_id", chunk)
-            )
-            await _execute(q)
-
-        finals_mats = await _delete_final_bouts_for_categories(comp_id_str=comp_id_str, category_ids=set(cat_ids))
+        await _execute(
+            admin_supabase.table("competition_mats")
+            .update({"current_bout_id": None})
+            .eq("competition_id", comp_id_str)
+            .eq("mat_number", mat_number)
+        )
         await _set_next_for_mat(comp_id_str, mat_number)
         for m in sorted(finals_mats):
             await _set_next_for_mat(comp_id_str, int(m))
@@ -4441,7 +4820,7 @@ async def rollback_mat(comp_id: UUID, body: RollbackMatRequest):
             target_order = int(target.get("order_in_mat") or 0)
             fallback_res = await _execute(
                 admin_supabase.table("competition_bouts")
-                .select("id,updated_at")
+                .select("id,order_in_mat")
                 .eq("competition_id", comp_id_str)
                 .eq("mat_number", mat_number)
                 .eq("status", "done")
@@ -4452,16 +4831,16 @@ async def rollback_mat(comp_id: UUID, body: RollbackMatRequest):
             fb = (fallback_res.data or [])
             if not fb:
                 raise HTTPException(status_code=409, detail="Target bout is not done")
-            target_updated = fb[0].get("updated_at")
+            target_order = int(fb[0].get("order_in_mat") or target_order)
         else:
-            target_updated = target.get("updated_at")
+            target_order = int(target.get("order_in_mat") or 0)
         sel = await _execute(
             admin_supabase.table("competition_bouts")
             .select("id,category_id,bracket_type,order_in_mat,athlete_red_id,athlete_blue_id,stage")
             .eq("competition_id", comp_id_str)
             .eq("mat_number", mat_number)
             .eq("status", "done")
-            .gte("updated_at", target_updated)
+            .gt("order_in_mat", target_order)
             .limit(5000)
         )
         rolled_rows = sel.data or []
@@ -5095,6 +5474,24 @@ async def move_category(category_id: UUID, body: MoveCategoryRequest):
                 )
 
         for m in sorted(affected_mats):
+            ass_res = await _execute(
+                admin_supabase.table("competition_category_assignments")
+                .select("category_id")
+                .eq("competition_id", comp_id_str)
+                .eq("mat_number", int(m))
+                .limit(10000)
+            )
+            assigned = {str(r.get("category_id") or "") for r in (ass_res.data or []) if r.get("category_id")}
+            assigned = {c for c in assigned if c}
+            ordered = await _get_mat_category_order(comp_id_str, int(m), assigned_cat_ids=assigned)
+            if int(m) == int(to_mat) and cat_id_str in assigned and cat_id_str not in ordered:
+                ordered.append(cat_id_str)
+            await _set_mat_category_order(comp_id_str, int(m), ordered)
+            await _reorder_mat_bouts_by_category_order(
+                comp_id_str=comp_id_str, mat_number=int(m), desired_category_ids=ordered
+            )
+
+        for m in sorted(affected_mats):
             await _set_next_for_mat(comp_id_str, int(m))
 
         return {"ok": True, "moved": moved_count, "to_mat_number": to_mat}
@@ -5132,3 +5529,44 @@ async def move_bouts(body: MoveBoutsRequest):
     cat_id = next(iter(categories))
 
     return await move_category(UUID(cat_id), MoveCategoryRequest(competition_id=body.competition_id, to_mat_number=to_mat))
+
+
+@router.post("/competitions/{comp_id}/mats/{mat_number}/categories/reorder")
+async def reorder_mat_categories(comp_id: UUID, mat_number: int, body: ReorderMatCategoriesRequest):
+    if not admin_supabase:
+        raise HTTPException(status_code=500, detail="Service role not configured")
+    comp_id_str = str(comp_id)
+    mat_number = int(mat_number)
+    if mat_number < 1:
+        raise HTTPException(status_code=400, detail="Invalid mat number")
+
+    mats_count = await _get_mats_count(comp_id_str)
+    if mat_number > mats_count:
+        raise HTTPException(status_code=400, detail="Invalid mat number")
+
+    assigns_res = await _execute(
+        admin_supabase.table("competition_category_assignments")
+        .select("category_id")
+        .eq("competition_id", comp_id_str)
+        .eq("mat_number", int(mat_number))
+        .limit(10000)
+    )
+    assigned = [str(r.get("category_id") or "") for r in (assigns_res.data or []) if r.get("category_id")]
+    assigned_ids = {cid for cid in assigned if cid}
+    if not assigned_ids:
+        return {"ok": True, "mat_number": mat_number, "categories": 0, "affected_bouts": 0}
+
+    requested = [str(x) for x in body.category_ids]
+    requested = [cid for cid in requested if cid in assigned_ids]
+
+    current = await _get_mat_category_order(comp_id_str, int(mat_number), assigned_cat_ids=assigned_ids)
+    current_set = set(current)
+    remaining = [cid for cid in current if cid not in set(requested)]
+    missing = [cid for cid in sorted(assigned_ids) if cid not in current_set and cid not in set(requested)]
+    final_order = list(dict.fromkeys(requested + remaining + missing))
+
+    await _set_mat_category_order(comp_id_str, int(mat_number), final_order)
+    affected = await _reorder_mat_bouts_by_category_order(
+        comp_id_str=comp_id_str, mat_number=int(mat_number), desired_category_ids=final_order
+    )
+    return {"ok": True, "mat_number": mat_number, "categories": len(final_order), "affected_bouts": affected}
