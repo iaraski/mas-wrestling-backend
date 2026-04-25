@@ -3259,6 +3259,7 @@ async def _set_next_for_mat(comp_id_str: str, mat_number: int):
             cat_index.get(str(r.get("category_id") or ""), 10**9),
             _stage_group_rank(bracket_type=r.get("bracket_type"), stage=r.get("stage")),
             int(r.get("order_in_mat") or 0),
+            str(r.get("id") or ""),
         )
     )
     running = [r for r in rows if r.get("status") == "running"]
@@ -4206,7 +4207,10 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
 
     mats_out = []
     for m in range(1, mats_count + 1):
-        mat_bouts = sorted(bouts_by_mat.get(m, []), key=lambda x: int(x.get("order_in_mat") or 0))
+        mat_bouts = sorted(
+            bouts_by_mat.get(m, []),
+            key=lambda x: (int(x.get("order_in_mat") or 0), str(x.get("id") or "")),
+        )
         cat_items = cats_by_mat.get(m, []) or []
         min_order_by_cat_all = min_order_by_mat_cat.get(m) or {}
         min_order_by_cat: dict[str, int] = {}
@@ -4243,6 +4247,7 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
                 cat_index.get(str(r.get("category_id") or ""), 10**9),
                 _stage_group_rank(bracket_type=r.get("bracket_type"), stage=r.get("stage")),
                 int(r.get("order_in_mat") or 0),
+                str(r.get("id") or ""),
             )
         )
 
