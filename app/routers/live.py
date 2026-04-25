@@ -5541,6 +5541,7 @@ async def move_category(category_id: UUID, body: MoveCategoryRequest):
         for m in sorted(affected_mats):
             await _set_next_for_mat(comp_id_str, int(m))
 
+        cache.invalidate_prefix(f"live_state:v1:{comp_id_str}:")
         return {"ok": True, "moved": moved_count, "to_mat_number": to_mat}
     except HTTPException:
         raise
@@ -5598,33 +5599,38 @@ async def reorder_mat_categories(comp_id: UUID, mat_number: int, body: ReorderMa
         .eq("mat_number", int(mat_number))
         .limit(10000)
     )
-    assigned = [str(r.get("category_id") or "") for r in (assigns_res.data or []) if r.get("category_id")]
-    assigned_ids = {cid for cid in assigned if cid}
-    if not assigned_ids:
-        # Fallback for environments where assignments were not persisted:
-        # derive mat categories directly from existing bouts.
-        bouts_res = await _execute(
-            admin_supabase.table("competition_bouts")
-            .select("category_id")
-            .eq("competition_id", comp_id_str)
-            .eq("mat_number", int(mat_number))
-            .limit(100000)
-        )
-        assigned_ids = {
-            str(r.get("category_id") or "")
-            for r in (bouts_res.data or [])
-            if r.get("category_id")
-        }
-        assigned_ids = {cid for cid in assigned_ids if cid}
-        if assigned_ids:
-            try:
-                await _ensure_category_assignments(
-                    comp_id_str, {cid: int(mat_number) for cid in sorted(assigned_ids)}
-                )
-            except Exception:
-                # Some prod schemas may not support assignment upsert/update shape.
-                # Reorder should still work by directly reordering bouts.
-                pass
+    assigned_ids = {
+        str(r.get("category_id") or "")
+        for r in (assigns_res.data or [])
+        if r.get("category_id")
+    }
+    assigned_ids = {cid for cid in assigned_ids if cid}
+
+    # Always merge with factual categories present in mat bouts.
+    # On some prod datasets assignments can be stale/missing and that makes
+    # reorder appear "not saved" after reload.
+    bouts_res = await _execute(
+        admin_supabase.table("competition_bouts")
+        .select("category_id")
+        .eq("competition_id", comp_id_str)
+        .eq("mat_number", int(mat_number))
+        .limit(100000)
+    )
+    bout_cat_ids = {
+        str(r.get("category_id") or "")
+        for r in (bouts_res.data or [])
+        if r.get("category_id")
+    }
+    bout_cat_ids = {cid for cid in bout_cat_ids if cid}
+    assigned_ids = assigned_ids | bout_cat_ids
+    if assigned_ids:
+        try:
+            await _ensure_category_assignments(
+                comp_id_str, {cid: int(mat_number) for cid in sorted(assigned_ids)}
+            )
+        except Exception:
+            # Non-fatal for reorder: bout ordering persistence is the primary source.
+            pass
     if not assigned_ids:
         return {"ok": True, "mat_number": mat_number, "categories": 0, "affected_bouts": 0}
 
@@ -5649,4 +5655,5 @@ async def reorder_mat_categories(comp_id: UUID, mat_number: int, body: ReorderMa
     affected = await _reorder_mat_bouts_by_category_order(
         comp_id_str=comp_id_str, mat_number=int(mat_number), desired_category_ids=final_order
     )
+    cache.invalidate_prefix(f"live_state:v1:{comp_id_str}:")
     return {"ok": True, "mat_number": mat_number, "categories": len(final_order), "affected_bouts": affected}
