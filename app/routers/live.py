@@ -4211,43 +4211,28 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
         )
         cat_index = {str(x.get("id") or ""): idx for idx, x in enumerate(cat_items_sorted) if x.get("id")}
         running_bout = next((b for b in mat_bouts if b.get("status") == "running"), None)
-        next_marked = next((b for b in mat_bouts if b.get("status") == "next"), None)
-        current_bout = running_bout or next_marked
-        next_bout = None
-        if current_bout:
-            candidates = [
-                b
-                for b in mat_bouts
-                if b.get("status") == "queued"
-                and b.get("athlete_red_id") != b.get("athlete_blue_id")
-                and str(b.get("id") or "") != str(current_bout.get("id") or "")
-            ]
-            if candidates:
-                candidates.sort(
-                    key=lambda r: (
-                        int(r.get("round_index") or 0),
-                        cat_index.get(str(r.get("category_id") or ""), 10**9),
-                        _stage_group_rank(bracket_type=r.get("bracket_type"), stage=r.get("stage")),
-                        int(r.get("order_in_mat") or 0),
-                    )
-                )
-                next_bout = candidates[0]
-        if not next_bout:
-            candidates = [
-                b
-                for b in mat_bouts
-                if b.get("status") == "queued" and b.get("athlete_red_id") != b.get("athlete_blue_id")
-            ]
-            if candidates:
-                candidates.sort(
-                    key=lambda r: (
-                        int(r.get("round_index") or 0),
-                        cat_index.get(str(r.get("category_id") or ""), 10**9),
-                        _stage_group_rank(bracket_type=r.get("bracket_type"), stage=r.get("stage")),
-                        int(r.get("order_in_mat") or 0),
-                    )
-                )
-                next_bout = candidates[0]
+        queue_sorted = [
+            b
+            for b in mat_bouts
+            if b.get("status") in ("queued", "next") and b.get("athlete_red_id") != b.get("athlete_blue_id")
+        ]
+        queue_sorted.sort(
+            key=lambda r: (
+                int(r.get("round_index") or 0),
+                cat_index.get(str(r.get("category_id") or ""), 10**9),
+                _stage_group_rank(bracket_type=r.get("bracket_type"), stage=r.get("stage")),
+                int(r.get("order_in_mat") or 0),
+            )
+        )
+
+        # Don't trust stale DB "next" marker for UI ordering:
+        # always derive display order from deterministic queue sort.
+        if running_bout:
+            current_bout = running_bout
+            next_bout = queue_sorted[0] if queue_sorted else None
+        else:
+            current_bout = queue_sorted[0] if queue_sorted else None
+            next_bout = queue_sorted[1] if len(queue_sorted) > 1 else None
 
         rounds = sorted({int(b.get("round_index") or 0) for b in mat_bouts if b.get("round_index") is not None})
         rounds = [r for r in rounds if r > 0]
