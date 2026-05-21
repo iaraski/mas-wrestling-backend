@@ -1,199 +1,188 @@
 import os
 from pathlib import Path
-from supabase import create_client, Client, ClientOptions
-import httpx
+import asyncio
+from typing import Any, Dict, List, Optional
+
 from dotenv import load_dotenv
-from typing import Any, Dict, Optional, List
+from sqlalchemy import and_, delete, insert, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+from app.core.db import SessionLocal, tables
 
 env_path = Path(__file__).parent.parent.parent / ".env"
 root_env_path = env_path.parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 load_dotenv(dotenv_path=root_env_path, override=False)
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-APP_DEBUG = os.getenv("APP_DEBUG") == "1"
-
-if APP_DEBUG:
-    if SUPABASE_URL:
-        print(f"[Supabase] URL loaded: {SUPABASE_URL[:20]}...")
-    if SUPABASE_KEY:
-        print(f"[Supabase] Key loaded, length: {len(SUPABASE_KEY)}")
-    if SUPABASE_SERVICE_ROLE_KEY:
-        print(f"[Supabase] Service key loaded, length: {len(SUPABASE_SERVICE_ROLE_KEY)}")
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError(f"SUPABASE_URL and SUPABASE_KEY must be set in .env. Checked path: {env_path} (and {root_env_path})")
-
-SUPABASE_URL = SUPABASE_URL.strip().rstrip("/")
-if SUPABASE_URL.endswith("/rest/v1"):
-    SUPABASE_URL = SUPABASE_URL[: -len("/rest/v1")]
-if SUPABASE_URL.endswith("/auth/v1"):
-    SUPABASE_URL = SUPABASE_URL[: -len("/auth/v1")]
-
-if "/api/v1" in SUPABASE_URL:
-    raise ValueError("SUPABASE_URL must be the Supabase project URL (https://<ref>.supabase.co), not the backend API URL")
-
-try:
-    try:
-        http_timeout = float(os.getenv("SUPABASE_HTTP_TIMEOUT_SECONDS", "15"))
-    except Exception:
-        http_timeout = 15.0
-    try:
-        http_retries = int(os.getenv("SUPABASE_HTTP_RETRIES", "1"))
-    except Exception:
-        http_retries = 1
-    http_retries = max(0, min(http_retries, 5))
-    # Настраиваем кастомный HTTP-клиент для обхода ошибки SSL: UNEXPECTED_EOF_WHILE_READING
-    # Отключаем http2 и жестко ограничиваем время жизни keepalive-соединений
-    custom_httpx_client = httpx.Client(
-        http2=False,
-        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10, keepalive_expiry=10.0),
-        transport=httpx.HTTPTransport(retries=http_retries),
-        timeout=http_timeout
-    )
-    
-    opts = ClientOptions(
-        httpx_client=custom_httpx_client,
-        postgrest_client_timeout=int(http_timeout)
-    )
-    _sdk_supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=opts)
-except Exception as e:
-    print(f"[Supabase] Error creating client: {e}")
-    raise e
-
-_sdk_admin_supabase: Client | None = None
-if SUPABASE_SERVICE_ROLE_KEY:
-    try:
-        _sdk_admin_supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, options=opts)
-    except Exception as e:
-        print(f"[Supabase] Error creating admin client: {e}")
-        _sdk_admin_supabase = None
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip() or None
+SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip() or None
+SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip() or None
 
 
-class _PGResponse:
+class _DBResponse:
     def __init__(self, data: Any):
         self.data = data
 
 
-def _pg_in(values: List[Any]) -> str:
-    parts: List[str] = []
-    for v in values:
-        if v is None:
+def _parse_value(raw: str) -> Any:
+    v = raw
+    if v.lower() == "null":
+        return None
+    try:
+        if "." in v:
+            return float(v)
+        return int(v)
+    except Exception:
+        return v
+
+
+def _split_csv(raw: str) -> list[str]:
+    s = str(raw or "").strip()
+    if not s:
+        return []
+    return [p.strip() for p in s.split(",") if p.strip()]
+
+
+def _parse_or_expr(expr: str, table) -> Any:
+    s = str(expr or "").strip()
+    if s.startswith("(") and s.endswith(")"):
+        s = s[1:-1]
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for ch in s:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            part = "".join(buf).strip()
+            if part:
+                parts.append(part)
+            buf = []
             continue
-        parts.append(str(v))
-    return f"in.({','.join(parts)})"
+        buf.append(ch)
+    last = "".join(buf).strip()
+    if last:
+        parts.append(last)
+
+    conds: list[Any] = []
+    for part in parts:
+        if ".eq." in part:
+            col, val = part.split(".eq.", 1)
+            conds.append(table.c[col] == _parse_value(val))
+            continue
+        if ".neq." in part:
+            col, val = part.split(".neq.", 1)
+            conds.append(table.c[col] != _parse_value(val))
+            continue
+        if ".gte." in part:
+            col, val = part.split(".gte.", 1)
+            conds.append(table.c[col] >= _parse_value(val))
+            continue
+        if ".gt." in part:
+            col, val = part.split(".gt.", 1)
+            conds.append(table.c[col] > _parse_value(val))
+            continue
+        if ".lte." in part:
+            col, val = part.split(".lte.", 1)
+            conds.append(table.c[col] <= _parse_value(val))
+            continue
+        if ".lt." in part:
+            col, val = part.split(".lt.", 1)
+            conds.append(table.c[col] < _parse_value(val))
+            continue
+        if ".ilike." in part:
+            col, val = part.split(".ilike.", 1)
+            conds.append(table.c[col].ilike(str(val)))
+            continue
+        if ".in.(" in part and part.endswith(")"):
+            col, rest = part.split(".in.(", 1)
+            raw_vals = rest[:-1]
+            vals = [_parse_value(x) for x in _split_csv(raw_vals)]
+            conds.append(table.c[col].in_(vals))
+            continue
+
+    if not conds:
+        return None
+    if len(conds) == 1:
+        return conds[0]
+    return or_(*conds)
 
 
-class _PGClient:
-    def __init__(self, base_url: str, token: str, http: httpx.Client):
-        self._base_url = base_url.rstrip("/")
-        self._token = token
-        self._http = http
-
-    def _headers(self) -> Dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self._token}",
-            "apikey": self._token,
-            "Content-Type": "application/json",
-        }
-
-    def request(self, method: str, table: str, *, params: Dict[str, str], json: Any, prefer: List[str]) -> _PGResponse:
-        url = f"{self._base_url}/{table.lstrip('/')}"
-        headers = self._headers()
-        if prefer:
-            headers["Prefer"] = ",".join(prefer)
-        last_exc: Exception | None = None
-        for attempt in range(3):
-            try:
-                resp = self._http.request(method, url, params=params, headers=headers, json=json)
-                if resp.status_code >= 500:
-                    raise RuntimeError(f"Server error {resp.status_code}")
-                if resp.status_code >= 400:
-                    try:
-                        payload = resp.json()
-                    except Exception:
-                        payload = resp.text
-                    raise RuntimeError(f"PostgREST error {resp.status_code}: {payload}")
-                if resp.status_code == 204 or not resp.content:
-                    return _PGResponse(None)
-                return _PGResponse(resp.json())
-            except Exception as e:
-                last_exc = e
-                if attempt >= 2:
-                    break
-                import time as _t
-
-                _t.sleep(0.2 * (attempt + 1))
-        raise RuntimeError(f"PostgREST request failed: {repr(last_exc)}")
-
-
-class _PGQuery:
-    def __init__(self, client: _PGClient, table: str):
-        self._client = client
-        self._table = table
+class _DBQuery:
+    def __init__(self, table_name: str):
+        if table_name not in tables:
+            raise RuntimeError(f"Table not found: {table_name}")
+        self._table = tables[table_name]
         self._method: str = "GET"
-        self._select: Optional[str] = None
-        self._params: Dict[str, str] = {}
-        self._json: Any = None
-        self._prefer: List[str] = []
+        self._select_cols: Optional[list[str]] = None
+        self._filters: list[Any] = []
+        self._payload: Any = None
         self._single: bool = False
         self._maybe_single: bool = False
-        self._order: List[str] = []
+        self._order: list[Any] = []
+        self._limit: Optional[int] = None
+        self._on_conflict: Optional[str] = None
 
     def select(self, cols: str):
         self._method = "GET"
-        self._select = cols
+        if cols.strip() == "*" or ":" in cols or "(" in cols:
+            self._select_cols = None
+        else:
+            self._select_cols = _split_csv(cols)
         return self
 
     def eq(self, col: str, val: Any):
-        self._params[col] = f"eq.{val}"
+        self._filters.append(self._table.c[col] == val)
         return self
 
     def neq(self, col: str, val: Any):
-        self._params[col] = f"neq.{val}"
+        self._filters.append(self._table.c[col] != val)
         return self
 
     def gte(self, col: str, val: Any):
-        self._params[col] = f"gte.{val}"
+        self._filters.append(self._table.c[col] >= val)
         return self
 
     def gt(self, col: str, val: Any):
-        self._params[col] = f"gt.{val}"
+        self._filters.append(self._table.c[col] > val)
         return self
 
     def lte(self, col: str, val: Any):
-        self._params[col] = f"lte.{val}"
+        self._filters.append(self._table.c[col] <= val)
         return self
 
     def lt(self, col: str, val: Any):
-        self._params[col] = f"lt.{val}"
+        self._filters.append(self._table.c[col] < val)
         return self
 
     def ilike(self, col: str, pattern: str):
-        self._params[col] = f"ilike.{pattern}"
+        self._filters.append(self._table.c[col].ilike(pattern))
         return self
 
     def in_(self, col: str, values: List[Any]):
-        self._params[col] = _pg_in(values)
+        self._filters.append(self._table.c[col].in_(values))
         return self
 
     def or_(self, expr: str):
-        self._params["or"] = expr
+        cond = _parse_or_expr(expr, self._table)
+        if cond is not None:
+            self._filters.append(cond)
         return self
 
     def order(self, col: str, desc: bool = False, nullsfirst: bool | None = None):
-        part = f"{col}.{'desc' if desc else 'asc'}"
+        c = self._table.c[col]
+        o = c.desc() if desc else c.asc()
         if nullsfirst is True:
-            part += ".nullsfirst"
+            o = o.nullsfirst()
         elif nullsfirst is False:
-            part += ".nullslast"
-        self._order.append(part)
+            o = o.nullslast()
+        self._order.append(o)
         return self
 
     def limit(self, n: int):
-        self._params["limit"] = str(int(n))
+        self._limit = int(n)
         return self
 
     def single(self):
@@ -208,68 +197,106 @@ class _PGQuery:
 
     def insert(self, payload: Any):
         self._method = "POST"
-        self._json = payload
-        self._prefer = ["return=representation"]
+        self._payload = payload
         return self
 
     def update(self, payload: Any):
         self._method = "PATCH"
-        self._json = payload
-        self._prefer = ["return=representation"]
+        self._payload = payload
         return self
 
     def delete(self):
         self._method = "DELETE"
-        self._prefer = ["return=representation"]
         return self
 
     def upsert(self, payload: Any, on_conflict: str | None = None):
-        self._method = "POST"
-        self._json = payload
-        self._prefer = ["resolution=merge-duplicates", "return=representation"]
-        if on_conflict:
-            self._params["on_conflict"] = on_conflict
+        self._method = "UPSERT"
+        self._payload = payload
+        self._on_conflict = on_conflict
         return self
 
-    def execute(self) -> _PGResponse:
-        params = dict(self._params)
-        if self._select is not None:
-            params["select"] = self._select
-        if self._order:
-            params["order"] = ",".join(self._order)
-        resp = self._client.request(self._method, self._table, params=params, json=self._json, prefer=self._prefer)
-        data = resp.data
-        if self._single or self._maybe_single:
-            if data is None:
-                return _PGResponse(None)
-            if isinstance(data, list):
-                if not data:
-                    return _PGResponse(None)
-                return _PGResponse(data[0])
-            if isinstance(data, dict):
-                return _PGResponse(data)
-            return _PGResponse(None)
-        if data is None:
-            return _PGResponse([])
-        return _PGResponse(data)
+    async def execute_async(self) -> _DBResponse:
+        return await self._execute_async()
+
+    def execute(self) -> _DBResponse:
+        try:
+            asyncio.get_running_loop()
+            raise RuntimeError("Use await query.execute_async() for DB queries inside async context")
+        except RuntimeError as e:
+            if "no running event loop" not in str(e).lower():
+                raise
+        return asyncio.run(self._execute_async())
+
+    async def _execute_async(self) -> _DBResponse:
+        async with SessionLocal() as session:
+            if self._method == "GET":
+                cols = [self._table.c[c] for c in self._select_cols] if self._select_cols else [self._table]
+                stmt = select(*cols)
+                if self._filters:
+                    stmt = stmt.where(and_(*self._filters))
+                if self._order:
+                    stmt = stmt.order_by(*self._order)
+                if self._limit is not None:
+                    stmt = stmt.limit(self._limit)
+                res = await session.execute(stmt)
+                rows = res.mappings().all()
+                data = [dict(r) for r in rows]
+                if self._single or self._maybe_single:
+                    return _DBResponse(data[0] if data else None)
+                return _DBResponse(data)
+
+            if self._method == "POST":
+                stmt = insert(self._table).values(self._payload).returning(self._table)
+                res = await session.execute(stmt)
+                await session.commit()
+                data = [dict(r) for r in res.mappings().all()]
+                return _DBResponse(data)
+
+            if self._method == "PATCH":
+                stmt = update(self._table).values(self._payload)
+                if self._filters:
+                    stmt = stmt.where(and_(*self._filters))
+                stmt = stmt.returning(self._table)
+                res = await session.execute(stmt)
+                await session.commit()
+                data = [dict(r) for r in res.mappings().all()]
+                return _DBResponse(data)
+
+            if self._method == "DELETE":
+                stmt = delete(self._table)
+                if self._filters:
+                    stmt = stmt.where(and_(*self._filters))
+                stmt = stmt.returning(self._table)
+                res = await session.execute(stmt)
+                await session.commit()
+                data = [dict(r) for r in res.mappings().all()]
+                return _DBResponse(data)
+
+            if self._method == "UPSERT":
+                conflict = self._on_conflict or ""
+                cols = _split_csv(conflict)
+                if not cols:
+                    raise RuntimeError("on_conflict must be set for upsert")
+                payload = self._payload
+                stmt = pg_insert(self._table).values(payload)
+                excluded = stmt.excluded
+                set_map = {c.name: getattr(excluded, c.name) for c in self._table.c if c.name not in cols}
+                stmt = stmt.on_conflict_do_update(index_elements=[self._table.c[c] for c in cols], set_=set_map).returning(self._table)
+                res = await session.execute(stmt)
+                await session.commit()
+                data = [dict(r) for r in res.mappings().all()]
+                return _DBResponse(data)
+
+            raise RuntimeError(f"Unsupported method: {self._method}")
 
 
 class _SupabaseCompat:
-    def __init__(self, sdk: Client, token: str, base_url: str, http: httpx.Client):
-        self._sdk = sdk
-        self._pg = _PGClient(f"{base_url}/rest/v1", token, http)
+    def table(self, name: str) -> _DBQuery:
+        return _DBQuery(name)
 
-    def table(self, name: str) -> _PGQuery:
-        return _PGQuery(self._pg, name)
-
-    def from_(self, name: str) -> _PGQuery:
+    def from_(self, name: str) -> _DBQuery:
         return self.table(name)
 
-    def __getattr__(self, item: str):
-        return getattr(self._sdk, item)
 
-
-supabase: Client = _SupabaseCompat(_sdk_supabase, SUPABASE_KEY, SUPABASE_URL, custom_httpx_client)  # type: ignore
-admin_supabase: Client | None = None
-if _sdk_admin_supabase and SUPABASE_SERVICE_ROLE_KEY:
-    admin_supabase = _SupabaseCompat(_sdk_admin_supabase, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL, custom_httpx_client)  # type: ignore
+supabase = _SupabaseCompat()
+admin_supabase = _SupabaseCompat()

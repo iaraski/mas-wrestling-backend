@@ -1,15 +1,20 @@
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
+from fastapi.responses import StreamingResponse
 from typing import List
 from uuid import UUID
 from datetime import datetime
 from uuid import uuid4
 import os
+import io
 import httpx
 import anyio
-from app.core.supabase import supabase, admin_supabase, SUPABASE_URL, SUPABASE_KEY, SUPABASE_SERVICE_ROLE_KEY
+from PIL import Image, ImageDraw, ImageFont
 from app.core.rest import rest_get, rest_delete, rest_post, rest_patch
 from app.schemas.competition import Competition, CompetitionCreate, CompetitionUpdate
 from app.core.cache import cache
+from app.core.db import get_db, tables
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 router = APIRouter(prefix="/competitions", tags=["competitions"])
 
@@ -48,8 +53,9 @@ def _cat_key(cat: dict) -> tuple:
 async def _execute(query, *, retries: int = 2):
     for attempt in range(retries + 1):
         try:
-            res = await anyio.to_thread.run_sync(query.execute)
-            return res
+            if hasattr(query, "execute_async"):
+                return await query.execute_async()
+            return await anyio.to_thread.run_sync(query.execute)
         except Exception as e:
             if attempt >= retries:
                 raise e
@@ -74,7 +80,7 @@ async def get_active_competitions():
         cache.set(cache_key, data, ttl_seconds=60.0)
         return data
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Supabase unavailable: {repr(e)}")
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {repr(e)}")
 
 @router.get("/", response_model=List[Competition])
 async def get_competitions():
@@ -89,7 +95,7 @@ async def get_competitions():
         resp = await rest_get("competitions", params, write=False)
         rows = resp.json()
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Supabase unavailable: {repr(e)}")
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {repr(e)}")
     
     # Добавляем location_name в результат
     data = []
@@ -109,11 +115,6 @@ async def create_competition(comp: CompetitionCreate):
         if not comp_data.get("preview_url"):
             comp_data.pop("preview_url", None)
         
-        # Убеждаемся, что даты в правильном формате (строки ISO)
-        for field in ["mandate_start_date", "mandate_end_date", "start_date", "end_date"]:
-            if field in comp_data and isinstance(comp_data[field], datetime):
-                comp_data[field] = comp_data[field].isoformat()
-
         # Convert UUIDs to strings
         if "location_id" in comp_data and comp_data["location_id"]:
             comp_data["location_id"] = str(comp_data["location_id"])
@@ -137,10 +138,16 @@ async def create_competition(comp: CompetitionCreate):
             for cat in comp.categories:
                 cat_dict = cat.model_dump()
                 cat_dict["competition_id"] = new_comp["id"]
-                if isinstance(cat_dict.get("competition_day"), datetime):
-                    cat_dict["competition_day"] = cat_dict["competition_day"].isoformat()
-                if isinstance(cat_dict.get("mandate_day"), datetime):
-                    cat_dict["mandate_day"] = cat_dict["mandate_day"].isoformat()
+                
+                # Make sure string dates are parsed to datetime if they come as string
+                for d_field in ["competition_day", "mandate_day"]:
+                    val = cat_dict.get(d_field)
+                    if isinstance(val, str):
+                        try:
+                            cat_dict[d_field] = datetime.fromisoformat(val.replace("Z", "+00:00"))
+                        except ValueError:
+                            pass
+                            
                 categories_data.append(cat_dict)
 
             print(f"[Backend] Inserting {len(categories_data)} categories")
@@ -178,7 +185,7 @@ async def get_competition(comp_id: UUID):
         )
         rows = resp.json()
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Supabase unavailable: {repr(e)}")
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {repr(e)}")
     if not isinstance(rows, list) or not rows:
         raise HTTPException(status_code=404, detail="Competition not found")
     data = rows[0]
@@ -202,36 +209,41 @@ async def update_competition(comp_id: UUID, comp_update: CompetitionUpdate):
         for key, value in update_data.items():
             if isinstance(value, UUID):
                 update_data[key] = str(value)
-            elif isinstance(value, datetime):
-                update_data[key] = value.isoformat()
+            elif isinstance(value, str) and key in ["mandate_start_date", "mandate_end_date", "start_date", "end_date"]:
+                try:
+                    update_data[key] = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                except ValueError:
+                    pass
+
+        # Обновление основной таблицы соревнований
+        if update_data:
+            resp = await rest_patch(
+                "competitions",
+                {"id": f"eq.{comp_id_str}"},
+                update_data,
+                prefer="return=minimal",
+            )
+            if resp.status_code not in (200, 204):
+                raise HTTPException(status_code=400, detail=f"Failed to update competition: {resp.text}")
+
+        # Обновление секретарей (полная замена)
+        if secretaries_data is not None:
+            del_resp = await rest_delete(
+                "competition_secretaries",
+                {"competition_id": f"eq.{comp_id_str}"},
+            )
+            if del_resp.status_code not in (200, 204):
+                raise HTTPException(status_code=400, detail=f"Failed to clear secretaries: {del_resp.text}")
+            if secretaries_data:
+                secs_to_insert = [
+                    {"competition_id": comp_id_str, "user_id": str(sec_id)}
+                    for sec_id in secretaries_data
+                ]
+                ins = await rest_post("competition_secretaries", {}, secs_to_insert, prefer="return=minimal")
+                if ins.status_code not in (200, 201, 204):
+                    raise HTTPException(status_code=400, detail=f"Failed to insert secretaries: {ins.text}")
 
         if categories_data is None:
-            if update_data:
-                resp = await rest_patch(
-                    "competitions",
-                    {"id": f"eq.{comp_id_str}"},
-                    update_data,
-                    prefer="return=minimal",
-                )
-                if resp.status_code not in (200, 204):
-                    raise HTTPException(status_code=400, detail=f"Failed to update competition: {resp.text}")
-
-            if secretaries_data is not None:
-                del_resp = await rest_delete(
-                    "competition_secretaries",
-                    {"competition_id": f"eq.{comp_id_str}"},
-                )
-                if del_resp.status_code not in (200, 204):
-                    raise HTTPException(status_code=400, detail=f"Failed to clear secretaries: {del_resp.text}")
-                if secretaries_data:
-                    secs_to_insert = [
-                        {"competition_id": comp_id_str, "user_id": str(sec_id)}
-                        for sec_id in secretaries_data
-                    ]
-                    ins = await rest_post("competition_secretaries", {}, secs_to_insert, prefer="return=minimal")
-                    if ins.status_code not in (200, 201, 204):
-                        raise HTTPException(status_code=400, detail=f"Failed to insert secretaries: {ins.text}")
-
             cache.invalidate_prefix("competitions:")
             detail = await get_competition(comp_id)
             return detail
@@ -270,12 +282,16 @@ async def update_competition(comp_id: UUID, comp_update: CompetitionUpdate):
                 for cat in categories_data:
                     cat_dict = cat if isinstance(cat, dict) else cat.model_dump()
                     cat_dict["competition_id"] = comp_id_str
-                    if isinstance(cat_dict.get("competition_day"), datetime):
-                        cat_dict["competition_day"] = cat_dict["competition_day"].isoformat()
-                    if isinstance(cat_dict.get("mandate_day"), datetime):
-                        cat_dict["mandate_day"] = cat_dict["mandate_day"].isoformat()
-                    cat_dict["competition_day"] = _norm_iso(cat_dict.get("competition_day"))
-                    cat_dict["mandate_day"] = _norm_iso(cat_dict.get("mandate_day"))
+                    
+                    for d_field in ["competition_day", "mandate_day"]:
+                        val = cat_dict.get(d_field)
+                        if isinstance(val, str):
+                            try:
+                                cat_dict[d_field] = datetime.fromisoformat(val.replace("Z", "+00:00"))
+                            except ValueError:
+                                cat_dict[d_field] = None
+                        elif val is None:
+                            cat_dict[d_field] = None
                     
                     if "id" in cat_dict and cat_dict["id"]:
                         # Обновляем существующую
@@ -357,16 +373,6 @@ async def update_competition(comp_id: UUID, comp_update: CompetitionUpdate):
                     except Exception:
                         pass
                 
-        # Обновление секретарей (полная замена)
-        if secretaries_data is not None:
-            await rest_delete("competition_secretaries", {"competition_id": f"eq.{comp_id_str}"})
-            if secretaries_data:
-                secs_to_insert = [
-                    {"competition_id": comp_id_str, "user_id": str(sec_id)}
-                    for sec_id in secretaries_data
-                ]
-                await rest_post("competition_secretaries", {}, secs_to_insert, prefer="return=minimal")
-                
         # Возвращаем обновленное соревнование
         final_resp = await rest_get(
             "competitions",
@@ -386,13 +392,9 @@ async def update_competition(comp_id: UUID, comp_update: CompetitionUpdate):
 @router.post("/{comp_id}/preview")
 async def upload_competition_preview(comp_id: UUID, file: UploadFile = File(...)):
     try:
-        if not admin_supabase:
-            raise HTTPException(status_code=500, detail="Service role not configured for uploads")
-
         if not file.content_type or not file.content_type.startswith("image/"):
             raise HTTPException(status_code=400, detail="Only image files are supported")
 
-        bucket = os.getenv("SUPABASE_COMPETITION_PREVIEW_BUCKET", "competition-previews")
         filename = file.filename or "preview"
         ext = os.path.splitext(filename)[1].lower()
         if not ext:
@@ -403,7 +405,7 @@ async def upload_competition_preview(comp_id: UUID, file: UploadFile = File(...)
             else:
                 ext = ".jpg"
 
-        object_path = f"{comp_id}/preview{ext}"
+        object_path = f"competition-previews/{comp_id}/preview{ext}"
         content = await file.read()
 
         if not content:
@@ -412,44 +414,187 @@ async def upload_competition_preview(comp_id: UUID, file: UploadFile = File(...)
         if len(content) > 10 * 1024 * 1024:
             raise HTTPException(status_code=413, detail="File too large (max 10MB)")
 
-        try:
-            admin_supabase.storage.from_(bucket).remove(
-                [
-                    f"{comp_id}/preview.jpg",
-                    f"{comp_id}/preview.jpeg",
-                    f"{comp_id}/preview.png",
-                    f"{comp_id}/preview.webp",
-                    f"{comp_id}/preview",
-                ]
-            )
-        except Exception:
-            pass
+        from app.core.minio import delete_objects, put_object
 
-        admin_supabase.storage.from_(bucket).upload(
+        await delete_objects(f"competition-previews/{comp_id}/preview")
+        preview_url = await put_object(
             object_path,
             content,
-            file_options={"content-type": file.content_type or "application/octet-stream"},
+            content_type=file.content_type or "application/octet-stream",
         )
-
-        preview_url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{object_path}"
-        if not SUPABASE_SERVICE_ROLE_KEY or not SUPABASE_KEY:
-            raise HTTPException(status_code=500, detail="Supabase keys not configured")
-
-        async with httpx.AsyncClient(timeout=20.0, http2=False) as client:
-            resp = await client.patch(
-                f"{SUPABASE_URL}/rest/v1/competitions",
-                params={"id": f"eq.{str(comp_id)}"},
-                headers={
-                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                    "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                    "Content-Type": "application/json",
-                    "Prefer": "return=minimal",
-                },
-                json={"preview_url": preview_url},
-            )
+        resp = await rest_patch(
+            "competitions",
+            {"id": f"eq.{str(comp_id)}"},
+            {"preview_url": preview_url},
+            prefer="return=minimal",
+        )
         if resp.status_code not in (200, 204):
             raise HTTPException(status_code=500, detail=f"Failed to update preview_url: {resp.status_code} {resp.text}")
         cache.invalidate_prefix("competitions:")
         return {"preview_url": preview_url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/{comp_id}/diplomas")
+async def get_diplomas(comp_id: UUID, db: AsyncSession = Depends(get_db)):
+    # 1. Fetch competition and template ID
+    comp_id_str = str(comp_id)
+    resp = await rest_get("competitions", {"select": "certificate_template_id", "id": f"eq.{comp_id_str}"})
+    rows = resp.json()
+    if not rows or not rows[0].get("certificate_template_id"):
+        raise HTTPException(400, "Шаблон грамоты не выбран для этого соревнования")
+        
+    template_id = rows[0]["certificate_template_id"]
+    
+    # 2. Fetch template
+    t = tables.get("certificate_templates")
+    if t is None:
+        raise HTTPException(500, "Table not ready")
+    
+    res = await db.execute(select(t).where(t.c.id == template_id))
+    template = res.mappings().first()
+    if not template:
+        raise HTTPException(404, "Шаблон не найден")
+        
+    bg_url = template.get("background_image_url")
+    bg_bytes = None
+    if bg_url:
+        try:
+            async with httpx.AsyncClient() as client:
+                bg_resp = await client.get(bg_url)
+                bg_resp.raise_for_status()
+                bg_bytes = bg_resp.content
+        except Exception as e:
+            raise HTTPException(500, f"Не удалось загрузить фон: {e}")
+        
+    from app.routers.live import get_competition_results
+    results = await get_competition_results(comp_id)
+    
+    # 3. Generate pages
+    pdf_pages = []
+    
+    # Load fonts
+    font_regular_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Roboto-Regular.ttf")
+    font_bold_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Roboto-Bold.ttf")
+    
+    if not os.path.exists(font_regular_path):
+        raise HTTPException(500, "Font not found on server")
+        
+    comp_name = results.get("competition", {}).get("name", "")
+    date_str = datetime.now().strftime("%d.%m.%Y")
+    
+    # We'll map standard places
+    place_map = {0: "1", 1: "2", 2: "3", 3: "3"}
+    
+    # Фронтенд использует виртуальные координаты (A4_WIDTH=794, A4_HEIGHT=1123)
+    is_portrait = template.get("format") == 'A4_PORTRAIT'
+    virtual_width = 794 if is_portrait else 1123
+    virtual_height = 1123 if is_portrait else 794
+    
+    for cat in results.get("categories", []):
+        cat_name = cat.get("label", "")
+        
+        # Разделяем на возрастную и весовую категорию
+        # Обычно label выглядит как: "Юноши 14-15 лет, До 70 кг" или "Юниорки, Свыше 80 кг"
+        age_cat = cat_name
+        weight_cat = ""
+        if ", " in cat_name:
+            parts = cat_name.rsplit(", ", 1)
+            age_cat = parts[0]
+            weight_cat = parts[1].replace(" кг", "")
+            
+            # Обработка веса 999.0
+            if "До 999" in weight_cat:
+                # Если сырые данные попали сюда (хотя _category_label должен это обрабатывать)
+                weight_cat = "Свыше"
+
+        winners = cat.get("winners", [])
+        
+        # In Double Elimination we usually have 4 winners (1, 2, 3, 3)
+        # In Round Robin maybe 3 (1, 2, 3)
+        for idx, winner in enumerate(winners):
+            if idx > 3:
+                break # Only top 4 maximum
+            
+            place = place_map.get(idx, str(idx+1))
+            
+            if bg_bytes:
+                img = Image.open(io.BytesIO(bg_bytes)).convert("RGB")
+            else:
+                img = Image.new("RGB", (virtual_width, virtual_height), "white")
+            draw = ImageDraw.Draw(img)
+            
+            img_width, img_height = img.size
+            scale_x = img_width / virtual_width
+            scale_y = img_height / virtual_height
+            
+            full_name = winner.get("name", "").strip()
+            short_name = " ".join(full_name.split()[:2]) if full_name else ""
+
+            # Map variables
+            variables = {
+                "{{athlete_name}}": short_name,
+                "{{place}}": place,
+                "{{category}}": cat_name,
+                "{{weight_category}}": weight_cat,
+                "{{age_category}}": age_cat,
+                "{{competition_name}}": comp_name,
+                "{{date}}": date_str,
+                "{{team_name}}": winner.get("team", "")
+            }
+            
+            # Fetch team if not present but needed
+            # For simplicity, we just use what we have or empty string
+            
+            for el in template.get("elements", []):
+                text = el.get("text", "")
+                for k, v in variables.items():
+                    text = text.replace(k, str(v))
+                    
+                # Масштабируем координаты и размер шрифта
+                x = el.get("x", 0) * scale_x
+                y = el.get("y", 0) * scale_y
+                font_size = int(el.get("fontSize", 24) * scale_x * 1.33)
+                color = el.get("color", "#000000")
+                align = el.get("align", "left")
+                font_weight = el.get("fontWeight", "normal")
+                
+                font_path = font_bold_path if font_weight == "bold" else font_regular_path
+                try:
+                    font = ImageFont.truetype(font_path, font_size)
+                except:
+                    font = ImageFont.load_default()
+                    
+                try:
+                    bbox = draw.multiline_textbbox((0, 0), text, font=font, align=align)
+                    w = bbox[2] - bbox[0]
+                    h = bbox[3] - bbox[1]
+                    
+                    draw_y = y - h / 2
+                    
+                    draw_x = x
+                    if align == "center":
+                        draw_x = x - w / 2
+                    elif align == "right":
+                        draw_x = x - w
+                        
+                    draw.multiline_text((draw_x, draw_y), text, fill=color, font=font, align=align)
+                except:
+                    draw.text((x, y), text, fill=color, font=font)
+                    
+            pdf_pages.append(img)
+            
+    if not pdf_pages:
+        raise HTTPException(400, "Нет призеров для генерации дипломов")
+        
+    pdf_bytes = io.BytesIO()
+    pdf_pages[0].save(
+        pdf_bytes, "PDF", resolution=100.0, save_all=True, append_images=pdf_pages[1:]
+    )
+    pdf_bytes.seek(0)
+    
+    return StreamingResponse(
+        pdf_bytes, 
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=diplomas_{comp_id_str}.pdf"}
+    )

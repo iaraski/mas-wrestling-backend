@@ -1,133 +1,191 @@
-import anyio
-import httpx
-import os
-from typing import Dict, Any, Optional
-from app.core.supabase import SUPABASE_URL, SUPABASE_KEY, SUPABASE_SERVICE_ROLE_KEY
+from typing import Any, Dict, Optional
 
-_BASE = f"{SUPABASE_URL}/rest/v1"
+from sqlalchemy import and_, delete, insert, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-_client: Optional[httpx.AsyncClient] = None
+from app.core.db import SessionLocal, tables
 
-def _headers(write: bool = False) -> Dict[str, str]:
-    token = SUPABASE_SERVICE_ROLE_KEY if write else SUPABASE_KEY
-    return {
-        "Authorization": f"Bearer {token}",
-        "apikey": token,
-        "Content-Type": "application/json",
-    }
 
-async def _get_client() -> httpx.AsyncClient:
-    global _client
-    if _client is None:
+class DBResponse:
+    def __init__(self, status_code: int, data: Any = None, text: str = ""):
+        self.status_code = status_code
+        self._data = data
+        self.text = text
+
+    def json(self) -> Any:
+        return self._data
+
+
+def _parse_param(table, key: str, raw: Any):
+    s = str(raw)
+    if s.startswith("eq."):
+        return table.c[key] == s[3:]
+    if s.startswith("neq."):
+        return table.c[key] != s[4:]
+    if s.startswith("gte."):
+        return table.c[key] >= s[4:]
+    if s.startswith("gt."):
+        return table.c[key] > s[3:]
+    if s.startswith("lte."):
+        return table.c[key] <= s[4:]
+    if s.startswith("lt."):
+        return table.c[key] < s[3:]
+    if s.startswith("ilike."):
+        return table.c[key].ilike(s[6:])
+    if s.startswith("in.(") and s.endswith(")"):
+        vals = [v.strip() for v in s[4:-1].split(",") if v.strip()]
+        return table.c[key].in_(vals)
+    return None
+
+
+def _split_csv(raw: str) -> list[str]:
+    s = str(raw or "").strip()
+    if not s:
+        return []
+    return [p.strip() for p in s.split(",") if p.strip()]
+
+
+async def rest_get(path: str, params: Dict[str, Any], *, write: bool = False) -> DBResponse:
+    table_name = path.strip().lstrip("/").split("/", 1)[0]
+    if table_name not in tables:
+        return DBResponse(404, [], f"Table not found: {table_name}")
+    table = tables[table_name]
+
+    select_raw = str(params.get("select") or "*")
+    cols = None
+    if select_raw != "*" and ":" not in select_raw and "(" not in select_raw:
+        cols = [table.c[c] for c in _split_csv(select_raw)]
+
+    stmt = select(*(cols or [table]))
+    where_parts = []
+    order_raw = params.get("order")
+    limit_raw = params.get("limit")
+
+    for k, v in params.items():
+        if k in ("select", "order", "limit", "on_conflict"):
+            continue
+        if k not in table.c:
+            continue
+        cond = _parse_param(table, k, v)
+        if cond is not None:
+            where_parts.append(cond)
+
+    if where_parts:
+        stmt = stmt.where(and_(*where_parts))
+
+    if order_raw:
+        for part in _split_csv(str(order_raw)):
+            col, dir_ = part.split(".", 1) if "." in part else (part, "asc")
+            if col in table.c:
+                stmt = stmt.order_by(table.c[col].desc() if dir_ == "desc" else table.c[col].asc())
+
+    if limit_raw:
         try:
-            timeout_total = float(os.getenv("SUPABASE_REST_TIMEOUT_SECONDS", "20"))
+            stmt = stmt.limit(int(limit_raw))
         except Exception:
-            timeout_total = 20.0
-        try:
-            timeout_connect = float(os.getenv("SUPABASE_REST_CONNECT_TIMEOUT_SECONDS", "10"))
-        except Exception:
-            timeout_connect = 10.0
-        try:
-            max_retries = int(os.getenv("SUPABASE_REST_TRANSPORT_RETRIES", "1"))
-        except Exception:
-            max_retries = 1
-        _client = httpx.AsyncClient(
-            http2=False,
-            timeout=httpx.Timeout(timeout_total, connect=timeout_connect),
-            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20, keepalive_expiry=30.0),
-            transport=httpx.AsyncHTTPTransport(retries=max(0, max_retries)),
-        )
-    return _client
+            pass
 
-async def rest_get(path: str, params: Dict[str, Any], *, write: bool = False) -> httpx.Response:
-    url = f"{_BASE}/{path.lstrip('/')}"
-    client = await _get_client()
-    last_exc = None
-    try:
-        attempts = int(os.getenv("SUPABASE_REST_ATTEMPTS", "3"))
-    except Exception:
-        attempts = 3
-    attempts = max(1, min(attempts, 5))
-    for attempt in range(attempts):
-        try:
-            resp = await client.get(url, params=params, headers=_headers(write))
-            if resp.status_code >= 500:
-                raise RuntimeError(f"Server error {resp.status_code}")
-            return resp
-        except Exception as e:
-            last_exc = e
-            if attempt >= attempts - 1:
-                break
-            await anyio.sleep(0.35 * (2**attempt))
-    raise RuntimeError(f"REST GET failed: {repr(last_exc)}")
+    async with SessionLocal() as session:
+        res = await session.execute(stmt)
+        rows = [dict(r) for r in res.mappings().all()]
 
-async def rest_post(path: str, params: Dict[str, Any], json: Any, *, prefer: Optional[str] = None) -> httpx.Response:
-    url = f"{_BASE}/{path.lstrip('/')}"
-    client = await _get_client()
-    headers = _headers(write=True)
-    if prefer:
-        headers["Prefer"] = prefer
-    last_exc = None
-    for attempt in range(3):
-        try:
-            resp = await client.post(url, params=params, headers=headers, json=json)
-            if resp.status_code >= 500:
-                raise RuntimeError(f"Server error {resp.status_code}")
-            return resp
-        except Exception as e:
-            last_exc = e
-            if attempt >= 2:
-                break
-            await anyio.sleep(0.25 * (attempt + 1))
-    raise RuntimeError(f"REST POST failed: {repr(last_exc)}")
+        if table_name == "competitions" and ("categories:competition_categories" in select_raw):
+            ids = [str(r.get("id")) for r in rows if r.get("id")]
+            cats_table = tables.get("competition_categories")
+            if ids and cats_table is not None:
+                cats_res = await session.execute(select(cats_table).where(cats_table.c.competition_id.in_(ids)))
+                cats = [dict(r) for r in cats_res.mappings().all()]
+                by_comp: dict[str, list[dict]] = {}
+                for c in cats:
+                    by_comp.setdefault(str(c.get("competition_id")), []).append(c)
+                for r in rows:
+                    r["categories"] = by_comp.get(str(r.get("id")), [])
 
-async def rest_delete(path: str, params: Dict[str, Any]) -> httpx.Response:
-    url = f"{_BASE}/{path.lstrip('/')}"
-    client = await _get_client()
-    headers = _headers(write=True)
-    last_exc = None
-    for attempt in range(3):
-        try:
-            resp = await client.delete(url, params=params, headers=headers)
-            if resp.status_code >= 500:
-                raise RuntimeError(f"Server error {resp.status_code}")
-            return resp
-        except Exception as e:
-            last_exc = e
-            if attempt >= 2:
-                break
-            await anyio.sleep(0.25 * (attempt + 1))
-    raise RuntimeError(f"REST DELETE failed: {repr(last_exc)}")
+        if table_name == "competitions" and ("locations(" in select_raw):
+            loc_table = tables.get("locations")
+            if loc_table is not None:
+                loc_ids = [str(r.get("location_id")) for r in rows if r.get("location_id")]
+                if loc_ids:
+                    loc_res = await session.execute(select(loc_table).where(loc_table.c.id.in_(loc_ids)))
+                    locs = {str(r.get("id")): dict(r) for r in loc_res.mappings().all()}
+                    for r in rows:
+                        lid = str(r.get("location_id")) if r.get("location_id") else None
+                        if lid and lid in locs:
+                            r["locations"] = {"name": locs[lid].get("name")}
 
-async def rest_patch(path: str, params: Dict[str, Any], json: Any, *, prefer: Optional[str] = None) -> httpx.Response:
-    url = f"{_BASE}/{path.lstrip('/')}"
-    client = await _get_client()
-    headers = _headers(write=True)
-    if prefer:
-        headers["Prefer"] = prefer
-    last_exc = None
-    for attempt in range(3):
-        try:
-            resp = await client.patch(url, params=params, headers=headers, json=json)
-            if resp.status_code >= 500:
-                raise RuntimeError(f"Server error {resp.status_code}")
-            return resp
-        except Exception as e:
-            last_exc = e
-            if attempt >= 2:
-                break
-            await anyio.sleep(0.25 * (attempt + 1))
-    raise RuntimeError(f"REST PATCH failed: {repr(last_exc)}")
+    return DBResponse(200, rows, "")
 
-async def rest_upsert(table: str, payload: Dict[str, Any], *, on_conflict: Optional[str] = None) -> None:
-    params: Dict[str, Any] = {}
-    if on_conflict:
-        params["on_conflict"] = on_conflict
-    resp = await rest_post(
-        table,
-        params=params,
-        json=payload,
-        prefer="resolution=merge-duplicates,return=minimal",
-    )
-    if resp.status_code not in (200, 201, 204):
-        raise RuntimeError(f"Upsert {table} failed: {resp.status_code} {resp.text}")
+
+async def rest_post(path: str, params: Dict[str, Any], json: Any, *, prefer: Optional[str] = None) -> DBResponse:
+    table_name = path.strip().lstrip("/").split("/", 1)[0]
+    if table_name not in tables:
+        return DBResponse(404, [], f"Table not found: {table_name}")
+    table = tables[table_name]
+    async with SessionLocal() as session:
+        stmt = insert(table).values(json).returning(table)
+        res = await session.execute(stmt)
+        await session.commit()
+        rows = [dict(r) for r in res.mappings().all()]
+        return DBResponse(201, rows, "")
+
+
+async def rest_delete(path: str, params: Dict[str, Any]) -> DBResponse:
+    table_name = path.strip().lstrip("/").split("/", 1)[0]
+    if table_name not in tables:
+        return DBResponse(404, [], f"Table not found: {table_name}")
+    table = tables[table_name]
+    where_parts = []
+    for k, v in params.items():
+        if k not in table.c:
+            continue
+        cond = _parse_param(table, k, v)
+        if cond is not None:
+            where_parts.append(cond)
+    stmt = delete(table)
+    if where_parts:
+        stmt = stmt.where(and_(*where_parts))
+    stmt = stmt.returning(table)
+    async with SessionLocal() as session:
+        res = await session.execute(stmt)
+        await session.commit()
+        rows = [dict(r) for r in res.mappings().all()]
+        return DBResponse(200, rows, "")
+
+
+async def rest_patch(path: str, params: Dict[str, Any], json: Any, *, prefer: Optional[str] = None) -> DBResponse:
+    table_name = path.strip().lstrip("/").split("/", 1)[0]
+    if table_name not in tables:
+        return DBResponse(404, [], f"Table not found: {table_name}")
+    table = tables[table_name]
+    where_parts = []
+    for k, v in params.items():
+        if k not in table.c:
+            continue
+        cond = _parse_param(table, k, v)
+        if cond is not None:
+            where_parts.append(cond)
+    stmt = update(table).values(json)
+    if where_parts:
+        stmt = stmt.where(and_(*where_parts))
+    stmt = stmt.returning(table)
+    async with SessionLocal() as session:
+        res = await session.execute(stmt)
+        await session.commit()
+        rows = [dict(r) for r in res.mappings().all()]
+        return DBResponse(200, rows, "")
+
+
+async def rest_upsert(table_name: str, payload: Dict[str, Any], *, on_conflict: Optional[str] = None) -> None:
+    if table_name not in tables:
+        raise RuntimeError(f"Table not found: {table_name}")
+    table = tables[table_name]
+    conflict_cols = _split_csv(on_conflict or "")
+    if not conflict_cols:
+        raise RuntimeError("on_conflict must be provided")
+    stmt = pg_insert(table).values(payload)
+    excluded = stmt.excluded
+    set_map = {c.name: getattr(excluded, c.name) for c in table.c if c.name not in conflict_cols}
+    stmt = stmt.on_conflict_do_update(index_elements=[table.c[c] for c in conflict_cols], set_=set_map)
+    async with SessionLocal() as session:
+        await session.execute(stmt)
+        await session.commit()

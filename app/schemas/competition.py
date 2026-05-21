@@ -55,6 +55,7 @@ class CompetitionBase(BaseModel):
     start_date: datetime
     end_date: datetime
     mats_count: int = 1 # Количество помостов
+    certificate_template_id: Optional[UUID] = None
 
 class CompetitionCreate(CompetitionBase):
     categories: List[CategoryBase]
@@ -75,6 +76,7 @@ class CompetitionUpdate(BaseModel):
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
     mats_count: Optional[int] = None
+    certificate_template_id: Optional[UUID] = None
     # For simplicity in this iteration, categories and secretaries updates might require full replacement or separate endpoints.
     # We will include them for full replacement.
     categories: Optional[List[CategoryBase]] = None

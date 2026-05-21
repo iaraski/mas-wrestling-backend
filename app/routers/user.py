@@ -9,15 +9,50 @@ import anyio
 import hashlib
 import time
 from datetime import date
-from app.core.supabase import supabase, admin_supabase, SUPABASE_URL, SUPABASE_KEY, SUPABASE_SERVICE_ROLE_KEY
+from app.core.supabase import admin_supabase
 from app.core.rest import rest_upsert, rest_get, rest_delete, rest_patch, rest_post
 from app.core.ratelimit import allow as rl_allow
-from app.core.local_auth import get_user_id_from_bearer as _local_get_user_id_from_bearer
+from app.core.local_auth import get_user_id_from_bearer as _local_get_user_id_from_bearer, set_user_password
+from app.core.roles import get_role_codes
 from app.schemas.user import Role, UserProfile, RoleAssign, AdminCreate, ProfileResponse, ProfileCreate, PassportResponse, PassportBase, AthleteResponse
 
 router = APIRouter(prefix="/users", tags=["users"])
 
 _me_cache: dict[str, tuple[float, str]] = {}
+_staff_list_cache: dict[str, tuple[float, list[UserProfile]]] = {}
+_admins_cache: tuple[float, list[UserProfile]] | None = None
+
+
+@router.post("/uploads/photo")
+async def upload_photo_for_staff(
+    file: UploadFile = File(...),
+    authorization: str | None = Header(default=None),
+):
+    await _require_staff(authorization)
+    if not file.content_type or not str(file.content_type).startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image files are supported")
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large (max 10MB)")
+
+    filename = file.filename or "photo"
+    ext = os.path.splitext(filename)[1].lower()
+    if not ext:
+        ct = str(file.content_type or "").lower()
+        if ct == "image/png":
+            ext = ".png"
+        elif ct == "image/webp":
+            ext = ".webp"
+        else:
+            ext = ".jpg"
+
+    key = f"documents/admin/{uuid4().hex}{ext}"
+    from app.core.minio import put_object
+
+    await put_object(key, content, content_type=file.content_type or "application/octet-stream")
+    return {"photo_url": key}
 
 
 class AthleteDetailsUpdate(BaseModel):
@@ -62,40 +97,22 @@ def _is_staff_role(codes: list[str]) -> bool:
 
 
 async def _get_my_role_codes(user_id: str) -> list[str]:
-    if not admin_supabase:
-        return []
     try:
-        res = await _execute(
-            admin_supabase.table("user_roles")
-            .select("roles(code)")
-            .eq("user_id", user_id)
-        )
-        data = _safe_data(res) or []
-        out: list[str] = []
-        for r in data:
-            role = r.get("roles")
-            if isinstance(role, list):
-                role = role[0] if role else None
-            code = role.get("code") if isinstance(role, dict) else None
-            if code:
-                out.append(str(code))
-        return out
+        return await get_role_codes(user_id)
     except Exception:
         return []
 
 
 async def _is_profile_locked(user_id: str) -> bool:
-    if not admin_supabase:
-        return False
     try:
-        res = await _execute(
-            admin_supabase.table("registrations")
-            .select("stage")
-            .eq("user_id", user_id)
-            .maybe_single()
+        resp = await rest_get(
+            "registrations",
+            {"select": "stage", "user_id": f"eq.{user_id}", "limit": "1"},
+            write=True,
         )
-        data = _safe_data(res)
-        return bool(data and str(data.get("stage") or "") == "complete")
+        rows = resp.json()
+        row = rows[0] if isinstance(rows, list) and rows else {}
+        return bool(isinstance(row, dict) and str(row.get("stage") or "") == "complete")
     except Exception:
         return False
 
@@ -118,7 +135,10 @@ async def _require_staff(authorization: str | None) -> str:
 async def _execute(query, *, retries: int = 4):
     for attempt in range(retries + 1):
         try:
-            res = await anyio.to_thread.run_sync(query.execute)
+            if hasattr(query, "execute_async"):
+                res = await query.execute_async()
+            else:
+                res = await anyio.to_thread.run_sync(query.execute)
             if res is None:
                 raise HTTPException(status_code=503, detail="Supabase temporarily unavailable")
             if hasattr(res, "error") and getattr(res, "error"):
@@ -155,6 +175,155 @@ def _chunk(items: list[str], size: int) -> list[list[str]]:
 
 def _pg_in(ids: list[str]) -> str:
     return f"in.({','.join(ids)})"
+
+
+def _unwrap_rel(value):
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value if isinstance(value, dict) else None
+
+
+async def _list_user_profiles_by_role_ids(
+    role_ids: list[str],
+    *,
+    location_id: str | None = None,
+) -> list[UserProfile]:
+    if not role_ids:
+        return []
+
+    from uuid import UUID as _UUID
+
+    role_uuid_ids: list[object] = []
+    role_id_strs: list[str] = []
+    for rid in role_ids:
+        try:
+            u = _UUID(str(rid))
+            role_uuid_ids.append(u)
+            role_id_strs.append(str(u))
+        except Exception:
+            continue
+    if not role_uuid_ids:
+        return []
+
+    cache_key = f"{','.join(sorted(role_id_strs))}|{str(location_id or '')}"
+    now = time.time()
+    cached = _staff_list_cache.get(cache_key)
+    if cached and cached[0] > now:
+        return cached[1]
+
+    from sqlalchemy import and_ as _and, or_ as _or, select as _select
+    from app.core.db import SessionLocal, tables
+
+    users_t = tables["users"]
+    profiles_t = tables.get("profiles")
+    user_roles_t = tables["user_roles"]
+    roles_t = tables["roles"]
+    staff_locations_t = tables.get("staff_locations")
+    locations_t = tables.get("locations")
+    if profiles_t is None or staff_locations_t is None or locations_t is None:
+        return []
+
+    loc_uuid = None
+    if location_id:
+        try:
+            loc_uuid = _UUID(str(location_id))
+        except Exception:
+            loc_uuid = None
+
+    prof_loc = locations_t.alias("prof_loc")
+    staff_loc = locations_t.alias("staff_loc")
+
+    j = (
+        users_t.join(user_roles_t, user_roles_t.c.user_id == users_t.c.id)
+        .join(roles_t, roles_t.c.id == user_roles_t.c.role_id)
+        .outerjoin(profiles_t, profiles_t.c.user_id == users_t.c.id)
+        .outerjoin(
+            staff_locations_t,
+            _and(
+                staff_locations_t.c.user_id == users_t.c.id,
+                staff_locations_t.c.role_id == user_roles_t.c.role_id,
+            ),
+        )
+        .outerjoin(staff_loc, staff_loc.c.id == staff_locations_t.c.location_id)
+        .outerjoin(prof_loc, prof_loc.c.id == profiles_t.c.location_id)
+    )
+
+    cols = [
+        users_t.c.id.label("user_id"),
+        users_t.c.email,
+        profiles_t.c.full_name,
+        profiles_t.c.phone,
+        profiles_t.c.location_id.label("profile_location_id"),
+        prof_loc.c.name.label("profile_location_name"),
+        staff_locations_t.c.location_id.label("staff_location_id"),
+        staff_loc.c.name.label("staff_location_name"),
+        roles_t.c.code.label("role_code"),
+    ]
+
+    stmt = _select(*cols).select_from(j).where(roles_t.c.id.in_(role_uuid_ids)).limit(10000)
+    if loc_uuid is not None:
+        # Для секретарей (особенно глобальных соревнований) loc_uuid может быть передан как фильтр,
+        # но если мы хотим видеть ВСЕХ глобальных секретарей, нужно убедиться, что они подтягиваются.
+        # В данном случае фильтруем жестко по локации, если она передана
+        stmt = stmt.where(
+            _or_(
+                staff_locations_t.c.location_id == loc_uuid,
+                profiles_t.c.location_id == loc_uuid,
+            )
+        )
+
+    async with SessionLocal() as session:
+        res = await session.execute(stmt)
+        rows = [dict(r) for r in res.mappings().all()]
+
+    users_dict: dict[str, dict[str, object]] = {}
+    for r in rows:
+        uid = str(r.get("user_id") or "")
+        if not uid:
+            continue
+        if uid not in users_dict:
+            users_dict[uid] = {
+                "user_id": uid,
+                "email": r.get("email"),
+                "full_name": r.get("full_name"),
+                "phone": r.get("phone"),
+                "roles": set(),
+                "location_id": None,
+                "location_name": None,
+            }
+
+        role_code = r.get("role_code")
+        if role_code:
+            users_dict[uid]["roles"].add(str(role_code))
+
+        prof_loc_id = r.get("profile_location_id")
+        prof_loc_name = r.get("profile_location_name")
+        staff_loc_id = r.get("staff_location_id")
+        staff_loc_name = r.get("staff_location_name")
+
+        if prof_loc_id and prof_loc_name:
+            users_dict[uid]["location_id"] = str(prof_loc_id)
+            users_dict[uid]["location_name"] = str(prof_loc_name)
+        elif staff_loc_id and staff_loc_name and not users_dict[uid].get("location_id"):
+            users_dict[uid]["location_id"] = str(staff_loc_id)
+            users_dict[uid]["location_name"] = str(staff_loc_name)
+
+    result = [
+        UserProfile(
+            user_id=u["user_id"],
+            full_name=u.get("full_name"),
+            phone=u.get("phone"),
+            email=u.get("email"),
+            roles=sorted(list(u.get("roles") or [])),
+            location_id=u.get("location_id"),
+            location_name=u.get("location_name"),
+        )
+        for u in users_dict.values()
+    ]
+
+    result.sort(key=lambda item: ((item.full_name or "").lower(), (item.email or "").lower(), str(item.user_id)))
+    _staff_list_cache[cache_key] = (now + 10.0, result)
+    return result
 
 
 async def _get_seed_user_ids(limit: int, *, email_ilike: str | None = None, include_null_email: bool = True) -> list[str]:
@@ -468,29 +637,13 @@ async def debug_bootstrap_admin(
     password = str(body.password or "")
     if len(password) < 8:
         raise HTTPException(status_code=400, detail="Пароль должен быть не короче 8 символов")
-
-    if not SUPABASE_URL or not SUPABASE_KEY or not SUPABASE_SERVICE_ROLE_KEY:
-        raise HTTPException(status_code=500, detail="Supabase keys missing")
-
-    async with httpx.AsyncClient(timeout=25.0, http2=False) as client:
-        created = await client.post(
-            f"{SUPABASE_URL}/auth/v1/admin/users",
-            json={"email": email, "password": password, "email_confirm": True},
-            headers={
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                "Content-Type": "application/json",
-            },
-        )
-        if created.status_code not in (200, 201):
-            raise HTTPException(status_code=400, detail=f"Failed to create auth user: {created.text}")
-        payload = created.json() if created.content else {}
-        user_id = payload.get("id") if isinstance(payload, dict) else None
-        if not user_id:
-            raise HTTPException(status_code=400, detail="Auth user id missing in response")
+    user_id = str(uuid4())
 
     await rest_upsert("users", {"id": user_id, "email": email}, on_conflict="id")
     await rest_upsert("profiles", {"user_id": user_id, "full_name": body.full_name}, on_conflict="user_id")
+    ok_pwd = await set_user_password(user_id, password)
+    if not ok_pwd:
+        raise HTTPException(status_code=500, detail="Local auth is not configured (apply backend/sql/local_auth.sql)")
 
     role_codes = [str(c) for c in (body.role_codes or []) if str(c).strip()]
     if not role_codes:
@@ -618,8 +771,6 @@ async def _get_location_path_v2(location_id: str) -> dict:
 
 @router.put("/me/profile", response_model=ProfileResponse)
 async def update_my_profile(profile: ProfileCreate, authorization: str | None = Header(default=None)):
-    if not admin_supabase:
-        raise HTTPException(status_code=500, detail="Service role not configured")
     user_id = await _get_user_id_from_bearer(authorization)
     await _require_can_edit_self(user_id, authorization)
     payload: dict[str, object] = {"user_id": user_id}
@@ -631,13 +782,11 @@ async def update_my_profile(profile: ProfileCreate, authorization: str | None = 
         payload["city"] = profile.city.strip()
     if profile.location_id is not None:
         payload["location_id"] = str(profile.location_id)
-    q = admin_supabase.table("profiles").upsert(
-        payload,
-        on_conflict="user_id",
-    )
-    res = await _execute(q)
-    data = _safe_data(res)
-    return (data[0] if isinstance(data, list) and data else data) or {"user_id": user_id}
+    try:
+        await rest_upsert("profiles", payload, on_conflict="user_id")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to update profile: {repr(e)}")
+    return payload | {"user_id": user_id}
 
 @router.get("/me/athlete")
 async def get_my_athlete(authorization: str | None = Header(default=None)):
@@ -686,20 +835,13 @@ async def get_my_athlete(authorization: str | None = Header(default=None)):
 
 @router.put("/me/athlete")
 async def update_my_athlete(coach_name: Optional[str] = None, authorization: str | None = Header(default=None)):
-    if not admin_supabase:
-        raise HTTPException(status_code=500, detail="Service role not configured")
     user_id = await _get_user_id_from_bearer(authorization)
     await _require_can_edit_self(user_id, authorization)
-    q = admin_supabase.table("athletes").upsert(
-        {
-            "user_id": user_id,
-            "coach_name": coach_name,
-        },
-        on_conflict="user_id",
-    )
-    res = await _execute(q)
-    data = _safe_data(res)
-    return (data[0] if isinstance(data, list) and data else data) or {"user_id": user_id}
+    try:
+        await rest_upsert("athletes", {"user_id": user_id, "coach_name": coach_name}, on_conflict="user_id")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to update athlete: {repr(e)}")
+    return {"user_id": user_id, "coach_name": coach_name}
 
 @router.get("/me/details")
 async def get_my_details(authorization: str | None = Header(default=None)):
@@ -995,31 +1137,13 @@ async def submit_my_profile(
                 ext = ".jpg"
 
         object_path = f"documents/{user_id}/{uuid4().hex}{ext}"
-        bucket = "avatars"
-        def _sync_upload():
-            admin_supabase.storage.from_(bucket).upload(
-                object_path,
-                content,
-                file_options={"content-type": photo.content_type or "application/octet-stream"},
-            )
+        from app.core.minio import put_object
 
-        upload_exc = None
-        for attempt in range(3):
-            try:
-                await anyio.to_thread.run_sync(_sync_upload)
-                upload_exc = None
-                break
-            except Exception as e:
-                upload_exc = e
-                if attempt >= 2:
-                    break
-                await anyio.sleep(0.35 * (attempt + 1))
-        if upload_exc:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Supabase storage unavailable: {type(upload_exc).__name__}",
-            )
-        final_photo_url = object_path
+        final_photo_url = await put_object(
+            object_path,
+            content,
+            content_type=photo.content_type or "application/octet-stream",
+        )
 
     passport_payload: dict[str, object] = {"athlete_id": athlete_id}
     if birth_date is not None:
@@ -1030,9 +1154,6 @@ async def submit_my_profile(
         passport_payload["rank"] = str(rank).strip() or None
     if final_photo_url is not None:
         passport_payload["photo_url"] = final_photo_url
-
-    if not SUPABASE_SERVICE_ROLE_KEY or not SUPABASE_KEY or not SUPABASE_URL:
-        raise HTTPException(status_code=500, detail="Supabase keys not configured")
 
     try:
         await rest_upsert("passports", passport_payload, on_conflict="athlete_id")
@@ -1134,9 +1255,6 @@ async def get_my_applications(authorization: str | None = Header(default=None)):
 @router.post("/admin-create/", response_model=UserProfile)
 @router.post("/admin-create", response_model=UserProfile)
 async def create_admin_user(payload: AdminCreate):
-    if not admin_supabase:
-        raise HTTPException(status_code=500, detail="SUPABASE_SERVICE_ROLE_KEY is not set")
-
     is_admin = any("admin" in code for code in payload.role_codes)
     is_secretary = any("secretary" in code for code in payload.role_codes)
     if is_admin and is_secretary:
@@ -1145,31 +1263,13 @@ async def create_admin_user(payload: AdminCreate):
     if (is_admin or is_secretary) and not payload.location_id:
         raise HTTPException(status_code=400, detail="Для админов/секретарей нужна привязка к локации")
 
-    try:
-        auth_res = admin_supabase.auth.admin.create_user(
-            {
-                "email": payload.email,
-                "password": payload.password,
-                "email_confirm": True,
-            }
-        )
-    except Exception as e:
-        print(f"Error creating user in Supabase Auth: {e}")
-        raise HTTPException(status_code=400, detail=f"Ошибка создания пользователя в Auth: {str(e)}")
-
-    auth_user = None
-    if isinstance(auth_res, dict):
-        auth_user = auth_res.get("user")
-    else:
-        auth_user = getattr(auth_res, "user", None)
-
-    if not auth_user or not getattr(auth_user, "id", None):
-        raise HTTPException(status_code=400, detail="Failed to create auth user")
-
-    user_id = getattr(auth_user, "id")
+    user_id = str(uuid4())
 
     try:
         await rest_upsert("users", {"id": user_id, "email": payload.email}, on_conflict="id")
+        ok_pwd = await set_user_password(user_id, payload.password)
+        if not ok_pwd:
+            raise HTTPException(status_code=500, detail="Local auth is not configured (apply backend/sql/local_auth.sql)")
         await rest_upsert(
             "profiles",
             {
@@ -1206,11 +1306,6 @@ async def create_admin_user(payload: AdminCreate):
                 await rest_post("staff_locations", {}, to_insert_staff, prefer="return=minimal")
     except Exception as e:
         print(f"Error inserting user details to public tables: {e}")
-        # Если произошла ошибка при добавлении в публичные таблицы, стоит удалить пользователя из Auth
-        try:
-            admin_supabase.auth.admin.delete_user(str(user_id))
-        except:
-            pass
         raise HTTPException(status_code=400, detail=f"Ошибка сохранения данных: {str(e)}")
 
     loc_name = None
@@ -1244,65 +1339,67 @@ async def list_athletes(
     query: str | None = None,
     limit: int = 200,
 ):
-    if not admin_supabase:
-        raise HTTPException(status_code=500, detail="Service role not configured")
     await _require_staff(authorization)
 
     limit = max(1, min(int(limit), 500))
+    from sqlalchemy import select as _select
+    from app.core.db import SessionLocal, tables
 
-    user_ids: list[str] | None = None
-    if query:
-        q = await _execute(
-            admin_supabase.table("profiles")
-            .select("user_id")
-            .ilike("full_name", f"%{query}%")
-            .limit(500)
+    athletes_t = tables["athletes"]
+    users_t = tables["users"]
+    profiles_t = tables["profiles"]
+    passports_t = tables.get("passports")
+
+    async with SessionLocal() as session:
+        j = athletes_t.join(users_t, athletes_t.c.user_id == users_t.c.id).outerjoin(
+            profiles_t, profiles_t.c.user_id == users_t.c.id
         )
-        data = _safe_data(q) or []
-        user_ids = [str(p.get("user_id")) for p in data if p.get("user_id")]
-        if not user_ids:
-            return []
+        if passports_t is not None:
+            j = j.outerjoin(passports_t, passports_t.c.athlete_id == athletes_t.c.id)
 
-    athletes_q = (
-        admin_supabase.table("athletes")
-        .select(
-            "id,user_id,coach_name,"
-            "users:users!athletes_user_id_fkey(email,profiles(full_name,phone,city,location_id)),"
-            "passports(birth_date,gender,rank,photo_url)"
-        )
-        .limit(limit)
-    )
-    if user_ids is not None:
-        athletes_q = athletes_q.in_("user_id", user_ids)
+        cols = [
+            athletes_t.c.id.label("athlete_id"),
+            athletes_t.c.user_id,
+            athletes_t.c.coach_name,
+            users_t.c.email,
+            profiles_t.c.full_name,
+            profiles_t.c.phone,
+            profiles_t.c.city,
+            profiles_t.c.location_id,
+        ]
+        if passports_t is not None:
+            cols.extend(
+                [
+                    passports_t.c.birth_date,
+                    passports_t.c.gender,
+                    passports_t.c.rank,
+                    passports_t.c.photo_url,
+                ]
+            )
 
-    res = await _execute(athletes_q)
-    rows = _safe_data(res) or []
+        stmt = _select(*cols).select_from(j).limit(limit)
+        if query:
+            stmt = stmt.where(profiles_t.c.full_name.ilike(f"%{query}%"))
+
+        res = await session.execute(stmt)
+        rows = [dict(r) for r in res.mappings().all()]
+
     out: list[dict] = []
     for r in rows:
-        users_data = r.get("users")
-        if isinstance(users_data, list):
-            users_data = users_data[0] if users_data else None
-        profiles_data = users_data.get("profiles") if isinstance(users_data, dict) else None
-        if isinstance(profiles_data, list):
-            profiles_data = profiles_data[0] if profiles_data else None
-        passports_data = r.get("passports")
-        if isinstance(passports_data, list):
-            passports_data = passports_data[0] if passports_data else None
-
         out.append(
             {
-                "athlete_id": r.get("id"),
+                "athlete_id": r.get("athlete_id"),
                 "user_id": r.get("user_id"),
-                "full_name": (profiles_data or {}).get("full_name"),
-                "phone": (profiles_data or {}).get("phone"),
-                "city": (profiles_data or {}).get("city"),
-                "location_id": (profiles_data or {}).get("location_id"),
-                "email": (users_data or {}).get("email") if isinstance(users_data, dict) else None,
+                "full_name": r.get("full_name"),
+                "phone": r.get("phone"),
+                "city": r.get("city"),
+                "location_id": r.get("location_id"),
+                "email": r.get("email"),
                 "coach_name": r.get("coach_name"),
-                "birth_date": (passports_data or {}).get("birth_date"),
-                "gender": (passports_data or {}).get("gender"),
-                "rank": (passports_data or {}).get("rank"),
-                "photo_url": (passports_data or {}).get("photo_url"),
+                "birth_date": r.get("birth_date"),
+                "gender": r.get("gender"),
+                "rank": r.get("rank"),
+                "photo_url": r.get("photo_url"),
             }
         )
     return out
@@ -1313,58 +1410,65 @@ async def get_athlete_details(
     athlete_id: UUID,
     authorization: str | None = Header(default=None),
 ):
-    if not admin_supabase:
-        raise HTTPException(status_code=500, detail="Service role not configured")
     await _require_staff(authorization)
+    from sqlalchemy import select as _select
+    from app.core.db import SessionLocal, tables
 
-    ath_res = await _execute(
-        admin_supabase.table("athletes")
-        .select("id,user_id,coach_name")
-        .eq("id", str(athlete_id))
-        .maybe_single()
-    )
-    athlete = _safe_data(ath_res)
-    if not athlete:
+    athletes_t = tables["athletes"]
+    users_t = tables["users"]
+    profiles_t = tables["profiles"]
+    passports_t = tables.get("passports")
+    registrations_t = tables.get("registrations")
+
+    async with SessionLocal() as session:
+        j = athletes_t.join(users_t, athletes_t.c.user_id == users_t.c.id).outerjoin(
+            profiles_t, profiles_t.c.user_id == users_t.c.id
+        )
+        if passports_t is not None:
+            j = j.outerjoin(passports_t, passports_t.c.athlete_id == athletes_t.c.id)
+        if registrations_t is not None:
+            j = j.outerjoin(registrations_t, registrations_t.c.user_id == users_t.c.id)
+
+        cols = [
+            athletes_t.c.id.label("athlete_id"),
+            athletes_t.c.user_id,
+            athletes_t.c.coach_name,
+            profiles_t.c.full_name,
+            profiles_t.c.phone,
+            profiles_t.c.city,
+            profiles_t.c.location_id,
+        ]
+        if passports_t is not None:
+            cols.extend(
+                [
+                    passports_t.c.birth_date,
+                    passports_t.c.gender,
+                    passports_t.c.rank,
+                    passports_t.c.photo_url,
+                ]
+            )
+        if registrations_t is not None:
+            cols.append(registrations_t.c.stage)
+
+        stmt = _select(*cols).select_from(j).where(athletes_t.c.id == athlete_id).limit(1)
+        res = await session.execute(stmt)
+        row = res.mappings().first()
+
+    if not row:
         raise HTTPException(status_code=404, detail="Athlete not found")
-
-    user_id = str(athlete.get("user_id"))
-    prof_res = await _execute(
-        admin_supabase.table("profiles")
-        .select("user_id,full_name,phone,city,location_id")
-        .eq("user_id", user_id)
-        .maybe_single()
-    )
-    prof = _safe_data(prof_res) or {}
-
-    p_res = await _execute(
-        admin_supabase.table("passports")
-        .select("birth_date,gender,rank,photo_url")
-        .eq("athlete_id", str(athlete_id))
-        .maybe_single()
-    )
-    p = _safe_data(p_res) or {}
-
-    reg_res = await _execute(
-        admin_supabase.table("registrations")
-        .select("stage")
-        .eq("user_id", user_id)
-        .maybe_single()
-    )
-    reg = _safe_data(reg_res) or {}
-    stage = str(reg.get("stage") or "start")
-
+    stage = str(row.get("stage") or "start")
     return {
-        "athlete_id": str(athlete_id),
-        "user_id": user_id,
-        "full_name": prof.get("full_name"),
-        "phone": prof.get("phone"),
-        "city": prof.get("city"),
-        "location_id": prof.get("location_id"),
-        "coach_name": athlete.get("coach_name"),
-        "birth_date": p.get("birth_date"),
-        "gender": p.get("gender"),
-        "rank": p.get("rank"),
-        "photo_url": p.get("photo_url"),
+        "athlete_id": str(row.get("athlete_id")),
+        "user_id": str(row.get("user_id")),
+        "full_name": row.get("full_name"),
+        "phone": row.get("phone"),
+        "city": row.get("city"),
+        "location_id": row.get("location_id"),
+        "coach_name": row.get("coach_name"),
+        "birth_date": row.get("birth_date"),
+        "gender": row.get("gender"),
+        "rank": row.get("rank"),
+        "photo_url": row.get("photo_url"),
         "stage": stage,
         "locked": bool(stage == "complete"),
     }
@@ -1376,55 +1480,79 @@ async def update_athlete_details(
     body: AdminAthleteUpdate,
     authorization: str | None = Header(default=None),
 ):
-    if not admin_supabase:
-        raise HTTPException(status_code=500, detail="Service role not configured")
     await _require_staff(authorization)
+    from sqlalchemy import select as _select, update as _update
+    from sqlalchemy.dialects.postgresql import insert as _pg_insert
+    from app.core.db import SessionLocal, tables
 
-    ath_res = await _execute(
-        admin_supabase.table("athletes")
-        .select("id,user_id")
-        .eq("id", str(athlete_id))
-        .maybe_single()
-    )
-    athlete = _safe_data(ath_res)
-    if not athlete:
-        raise HTTPException(status_code=404, detail="Athlete not found")
-    user_id = str(athlete.get("user_id"))
+    athletes_t = tables["athletes"]
+    profiles_t = tables["profiles"]
+    passports_t = tables.get("passports")
 
-    prof_payload: dict[str, object] = {"user_id": user_id}
-    if body.full_name is not None:
-        prof_payload["full_name"] = body.full_name
-    if body.phone is not None:
-        prof_payload["phone"] = body.phone
-    if body.city is not None:
-        prof_payload["city"] = body.city
-    if body.location_id is not None:
-        prof_payload["location_id"] = str(body.location_id)
-    await _execute(admin_supabase.table("profiles").upsert(prof_payload, on_conflict="user_id"))
+    async with SessionLocal() as session:
+        res = await session.execute(
+            _select(athletes_t.c.user_id).where(athletes_t.c.id == athlete_id).limit(1)
+        )
+        row = res.mappings().first()
+        if not row or not row.get("user_id"):
+            raise HTTPException(status_code=404, detail="Athlete not found")
+        user_id = row["user_id"]
 
-    if body.coach_name is not None:
-        await _execute(admin_supabase.table("athletes").update({"coach_name": body.coach_name}).eq("id", str(athlete_id)))
+        prof_payload: dict[str, object] = {"user_id": user_id}
+        if body.full_name is not None:
+            prof_payload["full_name"] = body.full_name
+        if body.phone is not None:
+            prof_payload["phone"] = body.phone
+        if body.city is not None:
+            prof_payload["city"] = body.city
+        if body.location_id is not None:
+            prof_payload["location_id"] = body.location_id
 
-    pass_payload: dict[str, object] = {"athlete_id": str(athlete_id)}
-    if body.birth_date is not None:
-        pass_payload["birth_date"] = str(body.birth_date)
-    if body.gender is not None:
-        pass_payload["gender"] = body.gender
-    if body.series is not None:
-        pass_payload["series"] = body.series
-    if body.number is not None:
-        pass_payload["number"] = body.number
-    if body.issued_by is not None:
-        pass_payload["issued_by"] = body.issued_by
-    if body.issue_date is not None:
-        pass_payload["issue_date"] = str(body.issue_date)
-    if body.rank is not None:
-        pass_payload["rank"] = body.rank
-    if body.photo_url is not None:
-        pass_payload["photo_url"] = body.photo_url
-    if body.passport_scan_url is not None:
-        pass_payload["passport_scan_url"] = body.passport_scan_url
-    await _execute(admin_supabase.table("passports").upsert(pass_payload, on_conflict="athlete_id"))
+        if len(prof_payload) > 1:
+            stmt = _pg_insert(profiles_t).values(prof_payload)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[profiles_t.c.user_id],
+                set_={k: stmt.excluded[k] for k in prof_payload.keys() if k != "user_id"},
+            )
+            await session.execute(stmt)
+
+        if body.coach_name is not None:
+            await session.execute(
+                _update(athletes_t)
+                .where(athletes_t.c.id == athlete_id)
+                .values({"coach_name": body.coach_name})
+            )
+
+        if passports_t is not None:
+            pass_payload: dict[str, object] = {"athlete_id": athlete_id}
+            if body.birth_date is not None:
+                pass_payload["birth_date"] = body.birth_date
+            if body.gender is not None:
+                pass_payload["gender"] = body.gender
+            if body.series is not None:
+                pass_payload["series"] = body.series
+            if body.number is not None:
+                pass_payload["number"] = body.number
+            if body.issued_by is not None:
+                pass_payload["issued_by"] = body.issued_by
+            if body.issue_date is not None:
+                pass_payload["issue_date"] = body.issue_date
+            if body.rank is not None:
+                pass_payload["rank"] = body.rank
+            if body.photo_url is not None:
+                pass_payload["photo_url"] = body.photo_url
+            if body.passport_scan_url is not None:
+                pass_payload["passport_scan_url"] = body.passport_scan_url
+
+            if len(pass_payload) > 1:
+                stmt = _pg_insert(passports_t).values(pass_payload)
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[passports_t.c.athlete_id],
+                    set_={k: stmt.excluded[k] for k in pass_payload.keys() if k != "athlete_id"},
+                )
+                await session.execute(stmt)
+
+        await session.commit()
 
     return {"ok": True}
 
@@ -1435,25 +1563,34 @@ async def set_athlete_editable(
     body: EditableUpdate,
     authorization: str | None = Header(default=None),
 ):
-    if not admin_supabase:
-        raise HTTPException(status_code=500, detail="Service role not configured")
     await _require_staff(authorization)
+    from sqlalchemy import select as _select
+    from sqlalchemy.dialects.postgresql import insert as _pg_insert
+    from app.core.db import SessionLocal, tables
 
-    ath_res = await _execute(
-        admin_supabase.table("athletes")
-        .select("user_id")
-        .eq("id", str(athlete_id))
-        .maybe_single()
-    )
-    athlete = _safe_data(ath_res)
-    if not athlete or not athlete.get("user_id"):
-        raise HTTPException(status_code=404, detail="Athlete not found")
+    athletes_t = tables["athletes"]
+    registrations_t = tables.get("registrations")
 
-    user_id = str(athlete.get("user_id"))
-    stage = "start" if body.editable else "complete"
-    await _execute(
-        admin_supabase.table("registrations").upsert({"user_id": user_id, "stage": stage}, on_conflict="user_id")
-    )
+    async with SessionLocal() as session:
+        res = await session.execute(
+            _select(athletes_t.c.user_id).where(athletes_t.c.id == athlete_id).limit(1)
+        )
+        row = res.mappings().first()
+        if not row or not row.get("user_id"):
+            raise HTTPException(status_code=404, detail="Athlete not found")
+        user_id = row["user_id"]
+
+        stage = "start" if body.editable else "complete"
+        if registrations_t is not None:
+            payload = {"user_id": user_id, "stage": stage}
+            stmt = _pg_insert(registrations_t).values(payload)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[registrations_t.c.user_id],
+                set_={"stage": stmt.excluded["stage"]},
+            )
+            await session.execute(stmt)
+            await session.commit()
+
     return {"ok": True, "stage": stage, "locked": bool(stage == "complete")}
 
 @router.get("/roles", response_model=List[Role])
@@ -1624,69 +1761,36 @@ async def get_secretaries(location_id: Optional[UUID] = None):
     )
     role_rows = roles_resp.json()
     role_ids = [str(r["id"]) for r in role_rows if isinstance(r, dict) and r.get("id")]
-    if not role_ids:
-        return []
-
-    params: dict[str, str] = {
-        "select": "user_id,location_id,locations(name),roles(code),users(email,profiles(full_name,phone))",
-        "role_id": _pg_in(role_ids),
-        "limit": "10000",
-    }
-    if location_id:
-        params["location_id"] = f"eq.{str(location_id)}"
-
-    res = await rest_get("staff_locations", params, write=True)
-    rows = res.json()
-    if not isinstance(rows, list):
-        return []
-
-    users_dict: dict[str, dict] = {}
-    for r in rows:
-        if not isinstance(r, dict) or not r.get("user_id"):
-            continue
-        uid = str(r["user_id"])
-        user = r.get("users") or {}
-        profile = user.get("profiles") if isinstance(user, dict) else None
-        if isinstance(profile, list):
-            profile = profile[0] if profile else None
-        roles = r.get("roles")
-        if isinstance(roles, list):
-            roles = roles[0] if roles else None
-        role_code = roles.get("code") if isinstance(roles, dict) else None
-
-        if uid not in users_dict:
-            loc = r.get("locations") if isinstance(r.get("locations"), dict) else None
-            users_dict[uid] = {
-                "user_id": uid,
-                "full_name": profile.get("full_name") if isinstance(profile, dict) else None,
-                "phone": profile.get("phone") if isinstance(profile, dict) else None,
-                "email": user.get("email") if isinstance(user, dict) else None,
-                "location_id": r.get("location_id"),
-                "location_name": loc.get("name") if loc else None,
-                "roles": [],
-            }
-        if role_code:
-            users_dict[uid]["roles"].append(str(role_code))
-
-    return [UserProfile(**u) for u in users_dict.values()]
+    return await _list_user_profiles_by_role_ids(
+        role_ids,
+        location_id=str(location_id) if location_id else None,
+    )
 
 
 @router.delete("/{user_id}/")
 @router.delete("/{user_id}")
 async def delete_user(user_id: UUID):
-    if not admin_supabase:
-        raise HTTPException(status_code=500, detail="SUPABASE_SERVICE_ROLE_KEY is not set")
-    
     try:
-        # Delete from Supabase Auth
-        # This usually cascades to public.users if FK is set up correctly
-        res = admin_supabase.auth.admin.delete_user(str(user_id))
-        
-        # Also explicitly try to delete from public.users just in case cascade is missing
-        # or if we want to be sure.
-        # However, if cascade is ON, this second delete might find nothing, which is fine.
-        await rest_delete("users", {"id": f"eq.{str(user_id)}"})
-        
+        uid = str(user_id)
+        ath_resp = await rest_get(
+            "athletes",
+            {"select": "id", "user_id": f"eq.{uid}", "limit": "1000"},
+            write=True,
+        )
+        ath_rows = ath_resp.json()
+        athlete_ids = [str(r.get("id")) for r in ath_rows if isinstance(r, dict) and r.get("id")] if isinstance(ath_rows, list) else []
+
+        if athlete_ids:
+            await rest_delete("passports", {"athlete_id": _pg_in(athlete_ids)})
+            await rest_delete("applications", {"athlete_id": _pg_in(athlete_ids)})
+            await rest_delete("athlete_coaches", {"athlete_id": _pg_in(athlete_ids)})
+
+        await rest_delete("staff_locations", {"user_id": f"eq.{uid}"})
+        await rest_delete("user_roles", {"user_id": f"eq.{uid}"})
+        await rest_delete("registrations", {"user_id": f"eq.{uid}"})
+        await rest_delete("profiles", {"user_id": f"eq.{uid}"})
+        await rest_delete("athletes", {"user_id": f"eq.{uid}"})
+        await rest_delete("users", {"id": f"eq.{uid}"})
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
         
@@ -1694,57 +1798,116 @@ async def delete_user(user_id: UUID):
 
 @router.get("/admins", response_model=List[UserProfile])
 async def get_admins():
-    admin_codes = ["founder", "world_admin", "world_secretary", "country_admin", "country_secretary", "region_admin", "region_secretary"]
+    global _admins_cache
+    now = time.time()
+    if _admins_cache and _admins_cache[0] > now:
+        return _admins_cache[1]
 
-    roles_resp = await rest_get(
-        "roles",
-        {"select": "id,code", "code": _pg_in([str(c) for c in admin_codes]), "limit": "1000"},
-        write=True,
-    )
-    role_rows = roles_resp.json()
-    role_ids = [str(r["id"]) for r in role_rows if isinstance(r, dict) and r.get("id")]
-    if not role_ids:
+    admin_codes = [
+        "world_admin",
+        "world_secretary",
+        "country_admin",
+        "country_secretary",
+        "region_admin",
+        "region_secretary",
+    ]
+
+    from sqlalchemy import Text as _Text, and_ as _and, cast as _cast, exists as _exists, func as _func, select as _select
+    from app.core.db import SessionLocal, tables
+
+    users_t = tables.get("users")
+    profiles_t = tables.get("profiles")
+    user_roles_t = tables.get("user_roles")
+    roles_t = tables.get("roles")
+    staff_locations_t = tables.get("staff_locations")
+    locations_t = tables.get("locations")
+    if (
+        users_t is None
+        or profiles_t is None
+        or user_roles_t is None
+        or roles_t is None
+        or staff_locations_t is None
+        or locations_t is None
+    ):
         return []
 
-    res = await rest_get(
-        "staff_locations",
-        {
-            "select": "user_id,location_id,locations(name),roles(code),users(email,profiles(full_name,phone))",
-            "role_id": _pg_in(role_ids),
-            "limit": "10000",
-        },
-        write=True,
-    )
-    rows = res.json()
-    if not isinstance(rows, list):
-        return []
+    prof_loc = locations_t.alias("prof_loc")
+    staff_loc = locations_t.alias("staff_loc")
 
-    users_dict: dict[str, dict] = {}
+    founder_exists = _exists(
+        _select(1)
+        .select_from(user_roles_t.join(roles_t, roles_t.c.id == user_roles_t.c.role_id))
+        .where(
+            _and(
+                user_roles_t.c.user_id == users_t.c.id,
+                roles_t.c.code == "founder",
+            )
+        )
+    )
+
+    staff_join = staff_locations_t.join(staff_loc, staff_loc.c.id == staff_locations_t.c.location_id)
+
+    j = (
+        users_t.join(user_roles_t, user_roles_t.c.user_id == users_t.c.id)
+        .join(roles_t, roles_t.c.id == user_roles_t.c.role_id)
+        .outerjoin(profiles_t, profiles_t.c.user_id == users_t.c.id)
+        .outerjoin(prof_loc, prof_loc.c.id == profiles_t.c.location_id)
+        .outerjoin(
+            staff_join,
+            _and(
+                staff_locations_t.c.user_id == users_t.c.id,
+                staff_locations_t.c.role_id == user_roles_t.c.role_id,
+            ),
+        )
+    )
+
+    staff_location_id = _func.max(_cast(staff_locations_t.c.location_id, _Text))
+    staff_location_name = _func.max(staff_loc.c.name)
+
+    stmt = (
+        _select(
+            users_t.c.id.label("user_id"),
+            users_t.c.email,
+            profiles_t.c.full_name,
+            profiles_t.c.phone,
+            _func.coalesce(_cast(profiles_t.c.location_id, _Text), staff_location_id).label("location_id"),
+            _func.coalesce(prof_loc.c.name, staff_location_name).label("location_name"),
+            _func.array_agg(_func.distinct(roles_t.c.code)).label("roles"),
+        )
+        .select_from(j)
+        .where(roles_t.c.code.in_(admin_codes))
+        .where(~founder_exists)
+        .group_by(
+            users_t.c.id,
+            users_t.c.email,
+            profiles_t.c.full_name,
+            profiles_t.c.phone,
+            profiles_t.c.location_id,
+            prof_loc.c.name,
+        )
+        .limit(10000)
+    )
+
+    async with SessionLocal() as session:
+        res = await session.execute(stmt)
+        rows = [dict(r) for r in res.mappings().all()]
+
+    out: list[UserProfile] = []
     for r in rows:
-        if not isinstance(r, dict) or not r.get("user_id"):
-            continue
-        uid = str(r["user_id"])
-        user = r.get("users") or {}
-        profile = user.get("profiles") if isinstance(user, dict) else None
-        if isinstance(profile, list):
-            profile = profile[0] if profile else None
-        roles = r.get("roles")
-        if isinstance(roles, list):
-            roles = roles[0] if roles else None
-        role_code = roles.get("code") if isinstance(roles, dict) else None
+        roles = r.get("roles") or []
+        role_list = [str(x) for x in roles] if isinstance(roles, list) else []
+        out.append(
+            UserProfile(
+                user_id=str(r.get("user_id")),
+                full_name=r.get("full_name"),
+                phone=r.get("phone"),
+                email=r.get("email"),
+                roles=sorted(role_list),
+                location_id=str(r.get("location_id")) if r.get("location_id") else None,
+                location_name=r.get("location_name"),
+            )
+        )
 
-        if uid not in users_dict:
-            loc = r.get("locations") if isinstance(r.get("locations"), dict) else None
-            users_dict[uid] = {
-                "user_id": uid,
-                "full_name": profile.get("full_name") if isinstance(profile, dict) else None,
-                "phone": profile.get("phone") if isinstance(profile, dict) else None,
-                "email": user.get("email") if isinstance(user, dict) else None,
-                "location_id": r.get("location_id"),
-                "location_name": loc.get("name") if loc else None,
-                "roles": [],
-            }
-        if role_code:
-            users_dict[uid]["roles"].append(str(role_code))
-
-    return [UserProfile(**u) for u in users_dict.values()]
+    out.sort(key=lambda item: ((item.full_name or "").lower(), (item.email or "").lower(), str(item.user_id)))
+    _admins_cache = (now + 10.0, out)
+    return out

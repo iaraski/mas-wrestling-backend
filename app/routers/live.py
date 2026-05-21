@@ -2018,6 +2018,8 @@ _competitions_has_finals_mat_column: bool | None = None
 async def _execute(query, *, retries: int = 2):
     for attempt in range(retries + 1):
         try:
+            if hasattr(query, "execute_async"):
+                return await query.execute_async()
             return await anyio.to_thread.run_sync(query.execute)
         except Exception as e:
             if attempt >= retries:
@@ -3396,17 +3398,31 @@ async def generate_live_bouts(comp_id: UUID, body: GenerateLiveBoutsRequest):
     )
     categories = categories_res.data or []
 
-    days = sorted({str(c.get("competition_day") or "")[:10] for c in categories if c.get("competition_day")})
+    comp_start_str = str(comp_start)[:10] if comp_start else ""
+    raw_days = set()
+    for c in categories:
+        c_day = str(c.get("competition_day") or "")[:10]
+        if not c_day:
+            c_day = comp_start_str
+        if c_day:
+            raw_days.add(c_day)
+    
+    days = sorted(raw_days)
     selected_day = None
     if body.day_index is not None and days:
         idx = int(body.day_index)
         if 1 <= idx <= len(days):
             selected_day = days[idx - 1]
-    allowed_cat_ids = (
-        {str(c["id"]) for c in categories if c.get("id") and str(c.get("competition_day") or "")[:10] == selected_day}
-        if selected_day
-        else None
-    )
+            
+    allowed_cat_ids = None
+    if selected_day:
+        allowed_cat_ids = set()
+        for c in categories:
+            c_day = str(c.get("competition_day") or "")[:10]
+            if not c_day:
+                c_day = comp_start_str
+            if c_day == selected_day:
+                allowed_cat_ids.add(str(c["id"]))
 
     if body.force_regenerate:
         await _execute(
@@ -3965,7 +3981,14 @@ async def withdraw_athlete(comp_id: UUID, body: WithdrawAthleteRequest):
 
 
 @router.get("/competitions/{comp_id}/state")
-async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int | None = None):
+async def get_live_state(
+    comp_id: UUID,
+    day: str | None = None,
+    day_index: int | None = None,
+    mat_number: int | None = None,
+    include_queue: bool = True,
+    include_history: bool = True,
+):
     if not admin_supabase:
         raise HTTPException(status_code=500, detail="Service role not configured")
     comp_id_str = str(comp_id)
@@ -3975,6 +3998,27 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
     comp = comp_res.data or {}
     mats_count = int(comp.get("mats_count") or 1)
     comp_start = comp.get("start_date")
+    selected_mat_number: int | None = None
+    if mat_number is not None:
+        try:
+            selected_mat_number = int(mat_number)
+        except Exception:
+            raise HTTPException(status_code=400, detail="mat_number must be an integer")
+        if selected_mat_number < 1 or selected_mat_number > mats_count:
+            raise HTTPException(status_code=400, detail="mat_number out of range")
+    target_mats = [selected_mat_number] if selected_mat_number is not None else list(range(1, mats_count + 1))
+
+    cache_key = (
+        f"live_state:v1:{comp_id_str}:"
+        f"day={str(day or '').strip()}:"
+        f"day_index={str(day_index or '')}:"
+        f"mat={str(selected_mat_number or 'all')}:"
+        f"q={1 if include_queue else 0}:"
+        f"h={1 if include_history else 0}"
+    )
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
 
     cats_res = await _execute(
         admin_supabase.table("competition_categories")
@@ -3982,7 +4026,15 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
         .eq("competition_id", comp_id_str)
     )
     categories = {str(c["id"]): c for c in (cats_res.data or []) if c.get("id")}
-    raw_days = {str(c.get("competition_day") or "")[:10] for c in categories.values() if c.get("competition_day")}
+    
+    comp_start_str = str(comp_start)[:10] if comp_start else ""
+    raw_days = set()
+    for c in categories.values():
+        c_day = str(c.get("competition_day") or "")[:10]
+        if not c_day:
+            c_day = comp_start_str
+        if c_day:
+            raw_days.add(c_day)
 
     def _day_sort_key(d: str):
         dl = str(d or "").strip().lower()
@@ -4007,11 +4059,16 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
         if selected_day and selected_day not in days:
             selected_day = None
     selected_day_index = (days.index(selected_day) + 1) if (selected_day and selected_day in days) else None
-    allowed_cat_ids = (
-        {cid for cid, c in categories.items() if str(c.get("competition_day") or "")[:10] == selected_day}
-        if selected_day
-        else None
-    )
+    
+    allowed_cat_ids = None
+    if selected_day:
+        allowed_cat_ids = set()
+        for cid, c in categories.items():
+            c_day = str(c.get("competition_day") or "")[:10]
+            if not c_day:
+                c_day = comp_start_str
+            if c_day == selected_day:
+                allowed_cat_ids.add(cid)
 
     order_col = await _get_assignments_order_column()
     assigns_sel = "category_id,mat_number"
@@ -4050,14 +4107,19 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
     bouts_all = bouts_res.data or []
     if allowed_cat_ids is not None:
         bouts_all = [b for b in bouts_all if str(b.get("category_id") or "") in allowed_cat_ids]
-    cats_with_bouts = {str(b.get("category_id")) for b in bouts_all if b.get("category_id")}
+    bouts_view = bouts_all
+    if selected_mat_number is not None:
+        bouts_view = [b for b in bouts_view if int(b.get("mat_number") or 0) == selected_mat_number]
+    cats_with_bouts = {str(b.get("category_id")) for b in bouts_view if b.get("category_id")}
 
-    cats_by_mat: dict[int, list[dict]] = {m: [] for m in range(1, mats_count + 1)}
-    seen_cats_by_mat: dict[int, set[str]] = {m: set() for m in range(1, mats_count + 1)}
+    cats_by_mat: dict[int, list[dict]] = {m: [] for m in target_mats}
+    seen_cats_by_mat: dict[int, set[str]] = {m: set() for m in target_mats}
     for a in assigns:
         cat_id = str(a.get("category_id") or "")
         mat = int(a.get("mat_number") or 0)
         if mat < 1 or mat > mats_count:
+            continue
+        if selected_mat_number is not None and mat != selected_mat_number:
             continue
         if cat_id and cat_id not in cats_with_bouts:
             continue
@@ -4076,7 +4138,7 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
             {
                 "id": cat_id,
                 "label": _category_label(cat, at_date=comp_start),
-                "day": str(cat.get("competition_day") or "")[:10] if cat.get("competition_day") else None,
+                "day": str(cat.get("competition_day") or "")[:10] if cat.get("competition_day") else comp_start_str,
                 "order": order_val,
             }
         )
@@ -4084,7 +4146,7 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
             seen_cats_by_mat.setdefault(mat, set()).add(cat_id)
 
     min_order_by_mat_cat: dict[int, dict[str, int]] = {}
-    for b in bouts_all:
+    for b in bouts_view:
         mat = int(b.get("mat_number") or 0)
         if mat < 1 or mat > mats_count:
             continue
@@ -4105,8 +4167,8 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
         if prev is None or oi < prev:
             d[cat_id] = oi
 
-    for m in range(1, mats_count + 1):
-        present = {str(b.get("category_id") or "") for b in bouts_all if int(b.get("mat_number") or 0) == m}
+    for m in target_mats:
+        present = {str(b.get("category_id") or "") for b in bouts_view if int(b.get("mat_number") or 0) == m}
         present = {c for c in present if c and c in categories}
         if not present:
             continue
@@ -4125,7 +4187,7 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
                 {
                     "id": cid,
                     "label": _category_label(cat, at_date=comp_start),
-                    "day": str(cat.get("competition_day") or "")[:10] if cat.get("competition_day") else None,
+                    "day": str(cat.get("competition_day") or "")[:10] if cat.get("competition_day") else comp_start_str,
                     "order": order_val,
                 }
             )
@@ -4139,13 +4201,13 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
 
     active_bouts = [
         b
-        for b in bouts_all
+        for b in bouts_view
         if b.get("status") in ("queued", "next", "running")
         and b.get("athlete_red_id") != b.get("athlete_blue_id")
     ]
     bye_bouts: list[dict] = [
         b
-        for b in bouts_all
+        for b in bouts_view
         if str(b.get("status") or "") == "done"
         and b.get("athlete_red_id") == b.get("athlete_blue_id")
         and str(b.get("stage") or "").startswith("bye")
@@ -4233,11 +4295,11 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
     done_bouts = len([b for b in scoped_all if str(b.get("status") or "") == "done" and b.get("winner_athlete_id")])
     remaining_bouts = len([b for b in scoped_all if str(b.get("status") or "") in ("queued", "next", "running")])
     is_finished = bool(has_started and total_bouts > 0 and remaining_bouts == 0 and done_bouts == total_bouts)
-    bouts_by_mat: dict[int, list[dict]] = {m: [] for m in range(1, mats_count + 1)}
-    byes_by_mat: dict[int, list[dict]] = {m: [] for m in range(1, mats_count + 1)}
+    bouts_by_mat: dict[int, list[dict]] = {m: [] for m in target_mats}
+    byes_by_mat: dict[int, list[dict]] = {m: [] for m in target_mats}
     for b in display_bouts:
         mat = int(b.get("mat_number") or 0)
-        if mat < 1 or mat > mats_count:
+        if mat not in bouts_by_mat:
             continue
         if b.get("athlete_red_id") == b.get("athlete_blue_id") and str(b.get("stage") or "").startswith("bye"):
             byes_by_mat[mat].append(b)
@@ -4245,7 +4307,9 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
             bouts_by_mat[mat].append(b)
 
     mats_out = []
-    for m in range(1, mats_count + 1):
+    has_name_cols = await _competition_bouts_has_name_columns()
+    has_score_cols = await _competition_bouts_has_score_columns()
+    for m in target_mats:
         mat_bouts = sorted(
             bouts_by_mat.get(m, []),
             key=lambda x: (int(x.get("order_in_mat") or 0), str(x.get("id") or "")),
@@ -4312,62 +4376,64 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
             current_bout = queue_sorted[0] if queue_sorted else None
             next_bout = queue_sorted[1] if len(queue_sorted) > 1 else None
 
-        # Show queue across all active rounds (no 2-round display window limit).
-        queue_bouts = mat_bouts[:400]
-        pin_ids = {str(x.get("id")) for x in [current_bout, next_bout] if x}
-        pin = [b for b in mat_bouts if str(b.get("id")) in pin_ids]
-        rest = [b for b in queue_bouts if str(b.get("id")) not in pin_ids]
-        queue_bouts = pin + rest
-        byes_for_mat = byes_by_mat.get(m, [])
-        # Show BYE only for an actually active round/group in this category on this mat.
-        # This hides stale BYEs from old rounds once the category has moved on.
-        active_round_group_keys = {
-            (
-                str(b.get("category_id") or ""),
-                int(b.get("round_index") or 0),
-                _stage_group_rank(bracket_type=b.get("bracket_type"), stage=b.get("stage")),
-            )
-            for b in mat_bouts
-            if b.get("category_id")
-        }
-        if active_round_group_keys:
-            byes_for_mat = [
-                b
-                for b in byes_for_mat
-                if (
+        queue_bouts: list[dict] = []
+        if include_queue:
+            # Show queue across all active rounds (no 2-round display window limit).
+            queue_bouts = mat_bouts[:400]
+            pin_ids = {str(x.get("id")) for x in [current_bout, next_bout] if x}
+            pin = [b for b in mat_bouts if str(b.get("id")) in pin_ids]
+            rest = [b for b in queue_bouts if str(b.get("id")) not in pin_ids]
+            queue_bouts = pin + rest
+            byes_for_mat = byes_by_mat.get(m, [])
+            # Show BYE only for an actually active round/group in this category on this mat.
+            # This hides stale BYEs from old rounds once the category has moved on.
+            active_round_group_keys = {
+                (
                     str(b.get("category_id") or ""),
                     int(b.get("round_index") or 0),
                     _stage_group_rank(bracket_type=b.get("bracket_type"), stage=b.get("stage")),
                 )
-                in active_round_group_keys
-            ]
-        else:
-            byes_for_mat = []
-        if byes_for_mat:
-            queue_bouts = queue_bouts + byes_for_mat
-            queue_bouts = sorted(
-                queue_bouts,
-                key=lambda r: (
-                    rollback_rank_for_mat.get(str(r.get("id") or ""), 10**9),
-                    int(r.get("round_index") or 0),
-                    cat_index.get(str(r.get("category_id") or ""), 10**9),
-                    _stage_group_rank(bracket_type=r.get("bracket_type"), stage=r.get("stage")),
-                    1 if str(r.get("athlete_red_id") or "") == str(r.get("athlete_blue_id") or "") else 0,
-                    int(r.get("order_in_mat") or 0),
-                    str(r.get("id") or ""),
-                ),
-            )
+                for b in mat_bouts
+                if b.get("category_id")
+            }
+            if active_round_group_keys:
+                byes_for_mat = [
+                    b
+                    for b in byes_for_mat
+                    if (
+                        str(b.get("category_id") or ""),
+                        int(b.get("round_index") or 0),
+                        _stage_group_rank(bracket_type=b.get("bracket_type"), stage=b.get("stage")),
+                    )
+                    in active_round_group_keys
+                ]
+            else:
+                byes_for_mat = []
+            if byes_for_mat:
+                queue_bouts = queue_bouts + byes_for_mat
+                queue_bouts = sorted(
+                    queue_bouts,
+                    key=lambda r: (
+                        rollback_rank_for_mat.get(str(r.get("id") or ""), 10**9),
+                        int(r.get("round_index") or 0),
+                        cat_index.get(str(r.get("category_id") or ""), 10**9),
+                        _stage_group_rank(bracket_type=r.get("bracket_type"), stage=r.get("stage")),
+                        1 if str(r.get("athlete_red_id") or "") == str(r.get("athlete_blue_id") or "") else 0,
+                        int(r.get("order_in_mat") or 0),
+                        str(r.get("id") or ""),
+                    ),
+                )
 
         cols_hist = (
             "id,competition_id,category_id,athlete_red_id,athlete_blue_id,bracket_type,round_index,stage,"
             "status,winner_athlete_id,mat_number,order_in_mat,updated_at"
         )
-        if await _competition_bouts_has_name_columns():
+        if has_name_cols:
             cols_hist += ",athlete_red_name,athlete_blue_name"
-        if await _competition_bouts_has_score_columns():
+        if has_score_cols:
             cols_hist += ",red_wins,blue_wins,wins_to"
         history_bouts: list[dict] = []
-        if allowed_cat_ids is None or allowed_cat_ids:
+        if include_history and (allowed_cat_ids is None or allowed_cat_ids):
             hist_q = (
                 admin_supabase.table("competition_bouts")
                 .select(cols_hist)
@@ -4432,6 +4498,7 @@ async def get_live_state(comp_id: UUID, day: str | None = None, day_index: int |
         },
         "mats": mats_out,
     }
+    cache.set(cache_key, result, ttl_seconds=2.0)
     return result
 
 
@@ -5856,16 +5923,33 @@ async def reorder_mat_categories(comp_id: UUID, mat_number: int, body: ReorderMa
             .limit(100000)
         )
         cats_raw = cats_res.data or []
-        days = sorted({str(c.get("competition_day") or "")[:10] for c in cats_raw if c.get("competition_day")})
+        
+        comp_res = await _execute(admin_supabase.table("competitions").select("start_date").eq("id", comp_id_str).single())
+        comp_start = (comp_res.data or {}).get("start_date")
+        comp_start_str = str(comp_start)[:10] if comp_start else ""
+
+        raw_days = set()
+        for c in cats_raw:
+            c_day = str(c.get("competition_day") or "")[:10]
+            if not c_day:
+                c_day = comp_start_str
+            if c_day:
+                raw_days.add(c_day)
+        days = sorted(raw_days)
+
         idx = int(body.day_index)
         if idx < 1 or idx > len(days):
             raise HTTPException(status_code=400, detail="Invalid day index")
         selected_day = days[idx - 1]
-        day_cat_ids = {
-            str(c.get("id") or "")
-            for c in cats_raw
-            if c.get("id") and str(c.get("competition_day") or "")[:10] == selected_day
-        }
+        
+        day_cat_ids = set()
+        for c in cats_raw:
+            c_day = str(c.get("competition_day") or "")[:10]
+            if not c_day:
+                c_day = comp_start_str
+            if c_day == selected_day:
+                day_cat_ids.add(str(c["id"]))
+        
         day_cat_ids = {cid for cid in day_cat_ids if cid}
         assigned_ids = {cid for cid in assigned_ids if cid in day_cat_ids}
 

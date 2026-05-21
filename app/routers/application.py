@@ -7,20 +7,66 @@ import time
 import os
 from datetime import datetime, timezone, timedelta
 from uuid import UUID, uuid4
+from urllib.parse import quote
 import anyio
-from app.core.supabase import supabase, admin_supabase
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
 from app.core.rest import rest_get, rest_post, rest_upsert, rest_patch, rest_delete
-from app.core.supabase import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 from app.core.local_auth import get_user_id_from_bearer as _local_get_user_id_from_bearer
 from app.schemas.competition import Application, ApplicationCreate, ApplicationUpdate
 
 from app.core.telegram import send_telegram_notification, get_telegram_file_url
+from app.core.minio import MINIO_ACCESS_KEY, MINIO_BUCKET, MINIO_ENDPOINT, MINIO_SECRET_KEY, put_object as _minio_put_object
 
 router = APIRouter(prefix="/applications", tags=["applications"])
 
 _me_cache: dict[str, tuple[float, str]] = {}
 _MSK_TZ = timezone(timedelta(hours=3))
 _APPLICATION_DEADLINE = datetime(2026, 4, 24, 19, 0, tzinfo=_MSK_TZ)
+
+_minio_s3 = None
+
+
+def _minio_client():
+    global _minio_s3
+    if _minio_s3 is None:
+        if not (MINIO_ENDPOINT and MINIO_ACCESS_KEY and MINIO_SECRET_KEY and MINIO_BUCKET):
+            raise RuntimeError("MinIO env is not configured")
+        _minio_s3 = boto3.client(
+            "s3",
+            endpoint_url=MINIO_ENDPOINT,
+            aws_access_key_id=MINIO_ACCESS_KEY,
+            aws_secret_access_key=MINIO_SECRET_KEY,
+            region_name=os.getenv("MINIO_REGION") or "us-east-1",
+            config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+        )
+    return _minio_s3
+
+
+def _supabase_headers() -> dict[str, str] | None:
+    key = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY") or "").strip()
+    if not key:
+        return None
+    return {"apikey": key, "authorization": f"Bearer {key}"}
+
+
+def _is_telegram_file_id(v: str) -> bool:
+    vv = (v or "").strip()
+    if not vv:
+        return False
+    if vv.lower().startswith("http"):
+        return False
+    if vv.startswith("documents/") or vv.startswith("/"):
+        return False
+    return True
+
+
+def _is_minio_key(v: str) -> bool:
+    vv = (v or "").strip()
+    if not vv:
+        return False
+    return vv.startswith("documents/") or vv.startswith("/")
 
 def _applications_open_now() -> bool:
     now = datetime.now(_MSK_TZ)
@@ -74,23 +120,9 @@ def _format_category_label(cat: dict, at_date: str | None) -> str:
 
 async def _get_role_codes(user_id: str) -> list[str]:
     try:
-        res = await rest_get(
-            "user_roles",
-            {"select": "roles(code)", "user_id": f"eq.{user_id}", "limit": "1000"},
-            write=True,
-        )
-        data = res.json() or []
-        out: list[str] = []
-        if not isinstance(data, list):
-            return []
-        for r in data:
-            role = r.get("roles") if isinstance(r, dict) else None
-            if isinstance(role, list):
-                role = role[0] if role else None
-            code = role.get("code") if isinstance(role, dict) else None
-            if code:
-                out.append(str(code))
-        return out
+        from app.core.roles import get_role_codes
+
+        return await get_role_codes(user_id)
     except Exception:
         return []
 
@@ -166,63 +198,85 @@ async def _get_user_id_from_bearer(authorization: str | None) -> str:
 @router.get("/", response_model=List[Application])
 async def get_applications(competition_id: Optional[UUID] = None):
     try:
-        params = {
-            "select": "*,competition:competitions(start_date),athletes(users!athletes_user_id_fkey(profiles(full_name,location_id,location:locations!profiles_location_id_fkey(name)))),competition_categories(*)",
-            "order": "created_at.desc",
-            "limit": "10000",
-        }
-        if competition_id:
-            params["competition_id"] = f"eq.{str(competition_id)}"
-        response = await rest_get("applications", params, write=True)
-        rows = response.json()
-        if not isinstance(rows, list):
-            rows = []
+        from sqlalchemy import select as _select
+        from app.core.db import SessionLocal, tables
 
-        # Преобразуем данные, чтобы вынести ФИО и описание категории
-        apps = []
+        apps_t = tables["applications"]
+        athletes_t = tables.get("athletes")
+        users_t = tables.get("users")
+        profiles_t = tables.get("profiles")
+        locs_t = tables.get("locations")
+        cats_t = tables.get("competition_categories")
+        comps_t = tables.get("competitions")
+
+        async with SessionLocal() as session:
+            stmt = _select(apps_t).order_by(apps_t.c.created_at.desc()).limit(10000)
+            if competition_id:
+                stmt = stmt.where(apps_t.c.competition_id == str(competition_id))
+            res = await session.execute(stmt)
+            rows = [dict(r) for r in res.mappings().all()]
+
+            athlete_ids = {str(r.get("athlete_id")) for r in rows if r.get("athlete_id")}
+            cat_ids = {str(r.get("category_id")) for r in rows if r.get("category_id")}
+            comp_ids = {str(r.get("competition_id")) for r in rows if r.get("competition_id")}
+
+            comp_start: dict[str, str | None] = {}
+            if comps_t is not None and comp_ids:
+                c_res = await session.execute(
+                    _select(comps_t.c.id, comps_t.c.start_date).where(comps_t.c.id.in_(list(comp_ids)))
+                )
+                for r in c_res.mappings().all():
+                    comp_start[str(r.get("id"))] = r.get("start_date")
+
+            cats_map: dict[str, dict] = {}
+            if cats_t is not None and cat_ids:
+                cat_res = await session.execute(_select(cats_t).where(cats_t.c.id.in_(list(cat_ids))))
+                for r in cat_res.mappings().all():
+                    cats_map[str(r.get("id"))] = dict(r)
+
+            athlete_map: dict[str, dict] = {}
+            if athletes_t is not None and users_t is not None and profiles_t is not None and athlete_ids:
+                j = athletes_t.join(users_t, athletes_t.c.user_id == users_t.c.id).outerjoin(
+                    profiles_t, profiles_t.c.user_id == users_t.c.id
+                )
+                if locs_t is not None:
+                    j = j.outerjoin(locs_t, profiles_t.c.location_id == locs_t.c.id)
+                cols = [
+                    athletes_t.c.id.label("athlete_id"),
+                    profiles_t.c.full_name,
+                    profiles_t.c.location_id,
+                ]
+                if locs_t is not None:
+                    cols.append(locs_t.c.name.label("region_name"))
+                a_res = await session.execute(_select(*cols).select_from(j).where(athletes_t.c.id.in_(list(athlete_ids))))
+                for r in a_res.mappings().all():
+                    athlete_map[str(r.get("athlete_id"))] = dict(r)
+
+        apps_out = []
         for app in rows:
-            full_name = "Unknown"
-            athlete_location_id = None
-            athlete_region = None
-            try:
-                # athlete -> users -> profiles -> full_name
-                if (app.get("athletes") and 
-                    app["athletes"].get("users") and 
-                    app["athletes"]["users"].get("profiles")):
-                    prof = app["athletes"]["users"]["profiles"]
-                    if isinstance(prof, list):
-                        prof = prof[0] if prof else None
-                    if isinstance(prof, dict):
-                        full_name = prof.get("full_name")
-                        athlete_location_id = prof.get("location_id")
-                        loc = prof.get("location")
-                        if isinstance(loc, list):
-                            loc = loc[0] if loc else None
-                        if isinstance(loc, dict):
-                            athlete_region = loc.get("name")
-            except Exception as e:
-                print(f"[Applications] Error parsing athlete name for app {app.get('id')}: {e}")
-            
-            # Данные категории
-            category_desc = "Unknown"
-            try:
-                if app.get("competition_categories"):
-                    cat = app["competition_categories"]
-                    comp = app.get("competition") or {}
-                    at_date = comp.get("start_date") if isinstance(comp, dict) else None
-                    category_desc = _format_category_label(cat, at_date)
-            except Exception as e:
-                print(f"[Applications] Error parsing category for app {app.get('id')}: {e}")
+            athlete_id = str(app.get("athlete_id")) if app.get("athlete_id") else ""
+            cat_id = str(app.get("category_id")) if app.get("category_id") else ""
+            comp_id = str(app.get("competition_id")) if app.get("competition_id") else ""
 
-            # Добавляем в объект
-            app["athlete_name"] = full_name or "Unknown"
+            a = athlete_map.get(athlete_id) or {}
+            full_name = a.get("full_name") or "Unknown"
+            athlete_location_id = a.get("location_id")
+            athlete_region = a.get("region_name")
+
+            cat = cats_map.get(cat_id) or None
+            at_date = comp_start.get(comp_id)
+            category_desc = _format_category_label(cat or {}, at_date) if cat else "Unknown"
+
+            app["athlete_name"] = full_name
             app["athlete_location_id"] = athlete_location_id
             app["athlete_region"] = athlete_region
-            app["category_description"] = category_desc or "Unknown"
-            apps.append(app)
-        return apps
+            app["category_description"] = category_desc
+            apps_out.append(app)
+
+        return apps_out
     except Exception as e:
         import traceback
+
         print(f"[Applications] CRITICAL ERROR: {e}")
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
@@ -260,14 +314,63 @@ async def get_photo_proxy(file_id: str):
             raise HTTPException(status_code=500, detail="Error downloading photo")
 
 
+@router.get("/photo-key/{key:path}")
+async def get_photo_key_proxy(key: str):
+    k = str(key or "").lstrip("/")
+    if not k.startswith("documents/"):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    def _get_from_minio():
+        try:
+            r = _minio_client().get_object(Bucket=MINIO_BUCKET, Key=k)
+            return r.get("Body").read(), r.get("ContentType")
+        except ClientError as e:
+            code = str((e.response or {}).get("Error", {}).get("Code") or "")
+            if code in {"NoSuchKey", "NoSuchObject", "404"}:
+                return None
+            raise
+
+    minio_res = await anyio.to_thread.run_sync(_get_from_minio)
+    if minio_res is not None:
+        content, ct = minio_res
+        return Response(
+            content=content,
+            media_type=ct or "application/octet-stream",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
+
+    supabase_url = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
+    headers = _supabase_headers()
+    if not supabase_url or not headers:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    encoded = quote(k, safe="/")
+    url = f"{supabase_url}/storage/v1/object/avatars/{encoded}"
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, http2=False) as client:
+        resp = await client.get(url, headers=headers)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=404, detail="Not found")
+        content = resp.content
+        ct = (resp.headers.get("content-type") or "").split(";", 1)[0].strip() or None
+
+    try:
+        await _minio_put_object(k, content, content_type=ct)
+    except Exception:
+        pass
+
+    return Response(
+        content=content,
+        media_type=ct or "application/octet-stream",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
 @router.post("/{app_id}/passport/photo")
 async def upload_passport_photo(
     app_id: UUID,
     photo: UploadFile = File(...),
     authorization: str | None = Header(default=None),
 ):
-    if not admin_supabase:
-        raise HTTPException(status_code=500, detail="Service role not configured")
     requester_id = await _get_user_id_from_bearer(authorization)
     codes = await _get_role_codes(requester_id)
     if not _is_staff(codes):
@@ -302,30 +405,15 @@ async def upload_passport_photo(
     athlete_id = str(app_rows[0]["athlete_id"])
 
     object_path = f"documents/{athlete_id}/{uuid4().hex}{ext}"
-    bucket = "avatars"
+    from app.core.minio import put_object
 
-    def _sync_upload():
-        admin_supabase.storage.from_(bucket).upload(
-            object_path,
-            content,
-            file_options={"content-type": photo.content_type or "application/octet-stream"},
-        )
+    photo_url = await put_object(
+        object_path,
+        content,
+        content_type=photo.content_type or "application/octet-stream",
+    )
 
-    upload_exc = None
-    for attempt in range(3):
-        try:
-            await anyio.to_thread.run_sync(_sync_upload)
-            upload_exc = None
-            break
-        except Exception as e:
-            upload_exc = e
-            if attempt >= 2:
-                break
-            await anyio.sleep(0.35 * (attempt + 1))
-    if upload_exc:
-        raise HTTPException(status_code=503, detail=f"Supabase storage unavailable: {type(upload_exc).__name__}")
-
-    return {"ok": True, "photo_url": object_path}
+    return {"ok": True, "photo_url": photo_url}
 
 @router.get("/{app_id}/")
 @router.get("/{app_id}")
@@ -341,20 +429,73 @@ async def get_application_details(app_id: UUID, authorization: str | None = Head
                 write = False
 
         # Получаем детальную информацию по заявке, включая паспорт
-        resp = await rest_get(
+        base_resp = await rest_get(
             "applications",
-            {
-                "select": "*,athletes(coach_name,user_id,users!athletes_user_id_fkey(email,profiles(full_name,phone,city,location_id))),competition_categories(*),competition:competitions(start_date,name)",
-                "id": f"eq.{str(app_id)}",
-                "limit": "1",
-            },
+            {"select": "*", "id": f"eq.{str(app_id)}", "limit": "1"},
             write=write,
         )
-        rows = resp.json()
-        if not isinstance(rows, list) or not rows:
+        base_rows = base_resp.json()
+        if not isinstance(base_rows, list) or not base_rows:
             raise HTTPException(status_code=404, detail="Application not found")
-            
-        app_data = rows[0]
+        app_data = base_rows[0]
+
+        athlete_id_val = app_data.get("athlete_id")
+        if athlete_id_val:
+            ath_resp = await rest_get(
+                "athletes",
+                {"select": "id,coach_name,user_id", "id": f"eq.{str(athlete_id_val)}", "limit": "1"},
+                write=write,
+            )
+            ath_rows = ath_resp.json()
+            athlete_row = ath_rows[0] if isinstance(ath_rows, list) and ath_rows else None
+        else:
+            athlete_row = None
+
+        users_row = None
+        profiles_row = None
+        if isinstance(athlete_row, dict) and athlete_row.get("user_id"):
+            u_resp = await rest_get(
+                "users",
+                {"select": "id,email", "id": f"eq.{str(athlete_row.get('user_id'))}", "limit": "1"},
+                write=write,
+            )
+            u_rows = u_resp.json()
+            users_row = u_rows[0] if isinstance(u_rows, list) and u_rows else None
+
+            p_resp = await rest_get(
+                "profiles",
+                {"select": "user_id,full_name,phone,city,location_id", "user_id": f"eq.{str(athlete_row.get('user_id'))}", "limit": "1"},
+                write=write,
+            )
+            p_rows = p_resp.json()
+            profiles_row = p_rows[0] if isinstance(p_rows, list) and p_rows else None
+
+        if isinstance(users_row, dict) and isinstance(profiles_row, dict):
+            users_row["profiles"] = profiles_row
+        if isinstance(athlete_row, dict) and isinstance(users_row, dict):
+            athlete_row["users"] = users_row
+        if athlete_row is not None:
+            app_data["athletes"] = athlete_row
+
+        if app_data.get("category_id"):
+            cat_resp = await rest_get(
+                "competition_categories",
+                {"select": "*", "id": f"eq.{str(app_data.get('category_id'))}", "limit": "1"},
+                write=write,
+            )
+            cat_rows = cat_resp.json()
+            if isinstance(cat_rows, list) and cat_rows:
+                app_data["competition_categories"] = cat_rows[0]
+
+        if app_data.get("competition_id"):
+            comp_resp = await rest_get(
+                "competitions",
+                {"select": "id,name,start_date", "id": f"eq.{str(app_data.get('competition_id'))}", "limit": "1"},
+                write=write,
+            )
+            comp_rows = comp_resp.json()
+            if isinstance(comp_rows, list) and comp_rows:
+                app_data["competition"] = comp_rows[0]
         
         # Получаем паспорт отдельно, так как он привязан к athlete_id
         athlete_id = app_data.get("athlete_id")
@@ -370,13 +511,12 @@ async def get_application_details(app_id: UUID, authorization: str | None = Head
             
             # Если есть фото, возвращаем URL на наш собственный прокси-эндпоинт
             if passport_data and passport_data.get("photo_url"):
-                file_id = passport_data["photo_url"]
-                if isinstance(file_id, str) and not (
-                    file_id.startswith("http")
-                    or file_id.startswith("documents/")
-                    or file_id.startswith("/")
-                ):
-                    passport_data["photo_url"] = f"/applications/photo/{file_id}"
+                raw = passport_data["photo_url"]
+                if isinstance(raw, str):
+                    if _is_telegram_file_id(raw):
+                        passport_data["photo_url"] = f"/applications/photo/{raw}"
+                    elif _is_minio_key(raw):
+                        passport_data["photo_url"] = f"/applications/photo-key/{raw.lstrip('/')}"
             
         app_data["passport"] = passport_data
         
@@ -609,8 +749,6 @@ async def admin_create_athlete_and_application(
     body: AdminCreateAthleteApplication,
     authorization: str | None = Header(default=None),
 ):
-    if not admin_supabase:
-        raise HTTPException(status_code=500, detail="Service role not configured")
     requester_id = await _get_user_id_from_bearer(authorization)
     codes = await _get_role_codes(requester_id)
     if not _is_staff(codes):
@@ -687,8 +825,6 @@ async def admin_apply_athlete_to_category(
     body: AdminApplyAthleteToCategory,
     authorization: str | None = Header(default=None),
 ):
-    if not admin_supabase:
-        raise HTTPException(status_code=500, detail="Service role not configured")
     requester_id = await _get_user_id_from_bearer(authorization)
     codes = await _get_role_codes(requester_id)
     if not _is_staff(codes):
@@ -799,8 +935,6 @@ async def admin_update_athlete_profile(
     body: AdminUpdateAthleteProfile,
     authorization: str | None = Header(default=None),
 ):
-    if not admin_supabase:
-        raise HTTPException(status_code=500, detail="Service role not configured")
     requester_id = await _get_user_id_from_bearer(authorization)
     codes = await _get_role_codes(requester_id)
     if not _is_staff(codes):
@@ -843,33 +977,6 @@ async def admin_update_athlete_profile(
 
         if current_email != email:
             await rest_patch("users", {"id": f"eq.{user_id}"}, {"email": email}, prefer="return=minimal")
-        if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
-            if current_email != email:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=8.0)) as client:
-                    upd = await client.patch(
-                        f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
-                        json={"email": email, "email_confirm": True},
-                        headers={
-                            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                            "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                            "Content-Type": "application/json",
-                        },
-                    )
-                    if upd.status_code in (200, 201, 204):
-                        pass
-                    elif upd.status_code == 404:
-                        pass
-                    else:
-                        t = (upd.text or "").strip()
-                        tl = t.lower()
-                        if "user not found" in tl or "not found" in tl:
-                            pass
-                        else:
-                            msg = t or f"status {upd.status_code}"
-                            raise HTTPException(
-                                status_code=400,
-                                detail=f"Failed to update auth email ({upd.status_code}): {msg}",
-                            )
 
     prof_payload: dict[str, object] = {
         "user_id": user_id,
@@ -922,8 +1029,6 @@ async def update_application_status(
     app_update: ApplicationUpdate,
     authorization: str | None = Header(default=None),
 ):
-    if not admin_supabase:
-        raise HTTPException(status_code=500, detail="Service role not configured")
     requester_id = await _get_user_id_from_bearer(authorization)
     codes = await _get_role_codes(requester_id)
     if not _is_staff(codes):
@@ -931,20 +1036,55 @@ async def update_application_status(
     
     # Сначала получим текущую заявку, чтобы знать telegram_id и название соревнования
     # Используем явное имя отношения для athletes -> users
-    resp = await rest_get(
+    base_resp = await rest_get(
         "applications",
-        {
-            "select": "*,competition:competitions(name,start_date),athletes(users!athletes_user_id_fkey(telegram_id)),competition_categories(*)",
-            "id": f"eq.{str(app_id)}",
-            "limit": "1",
-        },
+        {"select": "*", "id": f"eq.{str(app_id)}", "limit": "1"},
         write=True,
     )
-    rows = resp.json()
-    if not isinstance(rows, list) or not rows:
+    base_rows = base_resp.json()
+    if not isinstance(base_rows, list) or not base_rows:
         raise HTTPException(status_code=404, detail="Application not found")
-        
-    old_app = rows[0]
+
+    old_app = base_rows[0]
+    if old_app.get("competition_id"):
+        comp_resp = await rest_get(
+            "competitions",
+            {"select": "id,name,start_date", "id": f"eq.{str(old_app.get('competition_id'))}", "limit": "1"},
+            write=True,
+        )
+        comp_rows = comp_resp.json()
+        old_app["competition"] = comp_rows[0] if isinstance(comp_rows, list) and comp_rows else {}
+
+    if old_app.get("category_id"):
+        cat_resp = await rest_get(
+            "competition_categories",
+            {"select": "*", "id": f"eq.{str(old_app.get('category_id'))}", "limit": "1"},
+            write=True,
+        )
+        cat_rows = cat_resp.json()
+        old_app["competition_categories"] = cat_rows[0] if isinstance(cat_rows, list) and cat_rows else {}
+
+    telegram_id = None
+    if old_app.get("athlete_id"):
+        ath_resp = await rest_get(
+            "athletes",
+            {"select": "id,user_id", "id": f"eq.{str(old_app.get('athlete_id'))}", "limit": "1"},
+            write=True,
+        )
+        ath_rows = ath_resp.json()
+        if isinstance(ath_rows, list) and ath_rows and isinstance(ath_rows[0], dict):
+            uid = ath_rows[0].get("user_id")
+            if uid:
+                u_resp = await rest_get(
+                    "users",
+                    {"select": "id,telegram_id", "id": f"eq.{str(uid)}", "limit": "1"},
+                    write=True,
+                )
+                u_rows = u_resp.json()
+                if isinstance(u_rows, list) and u_rows and isinstance(u_rows[0], dict):
+                    telegram_id = u_rows[0].get("telegram_id")
+    if telegram_id is not None:
+        old_app["athletes"] = {"users": {"telegram_id": telegram_id}}
     
     # Обновляем статус
     update_data = app_update.model_dump(exclude_unset=True)

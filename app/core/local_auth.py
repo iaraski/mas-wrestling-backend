@@ -7,11 +7,9 @@ import secrets
 import time
 from uuid import uuid4
 
-import anyio
 from fastapi import HTTPException
 
 from app.core.rest import rest_get, rest_upsert
-from app.core.supabase import SUPABASE_KEY, SUPABASE_URL, admin_supabase
 
 
 def _b64url_encode(raw: bytes) -> str:
@@ -188,61 +186,5 @@ async def get_user_id_from_bearer(authorization: str | None) -> str:
     if not token:
         raise HTTPException(status_code=401, detail="Missing bearer token")
 
-    try:
-        payload = verify_access_token(token)
-        return str(payload.get("sub"))
-    except HTTPException:
-        pass
-
-    if not admin_supabase:
-        raise HTTPException(status_code=500, detail="Service role not configured")
-
-    def _sync_get_user():
-        return admin_supabase.auth.get_user(token)
-
-    try:
-        auth_res = await anyio.to_thread.run_sync(_sync_get_user)
-    except Exception as e:
-        msg = repr(e)
-        lowered = msg.lower()
-        if "jwt" in lowered or "token" in lowered or "401" in lowered or "403" in lowered:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        raise HTTPException(status_code=503, detail=f"Supabase Auth unavailable: {msg}")
-
-    user_obj = None
-    if isinstance(auth_res, dict):
-        user_obj = auth_res.get("user") or auth_res.get("data") or auth_res.get("user_data")
-    else:
-        user_obj = getattr(auth_res, "user", None) or getattr(auth_res, "data", None)
-
-    user_id = None
-    if hasattr(user_obj, "id"):
-        user_id = getattr(user_obj, "id")
-    elif isinstance(user_obj, dict):
-        user_id = user_obj.get("id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    return str(user_id)
-
-
-async def supabase_password_grant(email: str, password: str) -> dict | None:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return None
-    import httpx
-
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0), http2=False) as client:
-            resp = await client.post(
-                f"{SUPABASE_URL}/auth/v1/token",
-                params={"grant_type": "password"},
-                headers={"apikey": SUPABASE_KEY, "Content-Type": "application/json"},
-                json={"email": email, "password": password},
-            )
-    except Exception:
-        return None
-    if resp.status_code != 200:
-        return None
-    try:
-        return resp.json()
-    except Exception:
-        return None
+    payload = verify_access_token(token)
+    return str(payload.get("sub"))

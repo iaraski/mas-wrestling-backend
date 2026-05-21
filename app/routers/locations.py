@@ -34,7 +34,7 @@ async def get_locations(type: Optional[str] = None, parent_id: Optional[str] = N
         resp = await rest_get("locations", params, write=False)
         data = resp.json()
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Supabase unavailable: {repr(e)}")
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {repr(e)}")
     cache.set(cache_key, data, ttl_seconds=60.0)
     return data
 

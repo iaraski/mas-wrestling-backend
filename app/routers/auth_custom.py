@@ -12,8 +12,6 @@ import httpx
 from app.core.otp_store import generate_code
 from app.core.otp_db import consume as otp_consume_db, delete_sync as otp_delete_db_sync, store_sync as otp_store_db_sync
 from app.core.local_auth import ensure_user_row_for_email, issue_access_token, set_user_password
-from app.core.rest import rest_upsert
-from app.core.supabase import SUPABASE_KEY, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
 from urllib.parse import quote_plus
 import secrets
 
@@ -22,82 +20,6 @@ router = APIRouter(prefix="/auth-custom", tags=["auth-custom"])
 _smtp_lock = threading.Lock()
 _send_rl_lock = threading.Lock()
 _send_next_allowed: dict[str, float] = {}
-_auth_admin_client: httpx.AsyncClient | None = None
-
-
-async def _get_auth_admin_client() -> httpx.AsyncClient:
-    global _auth_admin_client
-    if _auth_admin_client is None:
-        timeout = httpx.Timeout(15.0, connect=6.0, read=15.0, write=15.0, pool=6.0)
-        _auth_admin_client = httpx.AsyncClient(
-            http2=False,
-            timeout=timeout,
-            limits=httpx.Limits(max_connections=30, max_keepalive_connections=12, keepalive_expiry=45.0),
-            transport=httpx.AsyncHTTPTransport(retries=1),
-        )
-    return _auth_admin_client
-
-
-async def _ensure_supabase_auth_user(email: str, password: str) -> str:
-    if not SUPABASE_URL or not SUPABASE_KEY or not SUPABASE_SERVICE_ROLE_KEY:
-        raise HTTPException(status_code=500, detail="Supabase keys missing")
-
-    client = await _get_auth_admin_client()
-
-    user_id: str | None = None
-    created = await client.post(
-        f"{SUPABASE_URL}/auth/v1/admin/users",
-        json={"email": email, "password": password, "email_confirm": True},
-        headers={
-            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-            "apikey": SUPABASE_SERVICE_ROLE_KEY,
-            "Content-Type": "application/json",
-        },
-    )
-
-    if created.status_code in (200, 201):
-        j = created.json() if created.headers.get("content-type", "").startswith("application/json") else {}
-        user_id = j.get("id") if isinstance(j, dict) else None
-    else:
-        txt = (created.text or "").lower()
-        if created.status_code in (400, 409, 422) and ("already" in txt or "exists" in txt or "registered" in txt):
-            try:
-                get_user = await client.get(
-                    f"{SUPABASE_URL}/auth/v1/admin/users",
-                    params={"email": email},
-                    headers={
-                        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                    },
-                )
-                if get_user.status_code == 200:
-                    j = get_user.json()
-                    if isinstance(j, dict):
-                        user_id = j.get("id") or j.get("user", {}).get("id")
-                    elif isinstance(j, list) and j:
-                        user_id = (j[0] or {}).get("id")
-            except Exception:
-                user_id = None
-            if user_id:
-                upd = await client.put(
-                    f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
-                    json={"password": password, "email_confirm": True},
-                    headers={
-                        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                        "Content-Type": "application/json",
-                    },
-                )
-                if upd.status_code not in (200, 201):
-                    raise HTTPException(status_code=400, detail="Не удалось обновить пароль. Попробуйте позже.")
-            else:
-                raise HTTPException(status_code=400, detail="Почта уже зарегистрирована.")
-        else:
-            raise HTTPException(status_code=400, detail="Не удалось создать пользователя. Попробуйте позже.")
-
-    if not user_id:
-        raise HTTPException(status_code=400, detail="Не удалось создать пользователя. Попробуйте позже.")
-    return str(user_id)
 
 def _truthy_env(name: str) -> bool:
     v = (os.getenv(name) or "").strip().lower()
@@ -367,31 +289,13 @@ async def verify_otp(body: VerifyOtpBody):
     await otp_consume_db(email, body.code, max_attempts=5)
     if not body.password or len(str(body.password)) < 8:
         raise HTTPException(status_code=400, detail="Пароль должен быть не короче 8 символов")
-    disable_supabase_signup = (os.getenv("AUTH_DISABLE_SUPABASE_AUTH_SIGNUP") or "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-    if disable_supabase_signup:
-        user_id = await ensure_user_row_for_email(email)
-        ok = await set_user_password(user_id, str(body.password))
-        if not ok:
-            raise HTTPException(
-                status_code=500,
-                detail="Local auth is not configured (apply backend/sql/local_auth.sql)",
-            )
-        access_token = issue_access_token(user_id=user_id, email=email)
-        return {"ok": True, "access_token": access_token, "token_type": "bearer", "user_id": user_id, "email": email}
-
-    user_id = await _ensure_supabase_auth_user(email, str(body.password))
-    try:
-        await rest_upsert("users", {"id": user_id, "email": email}, on_conflict="id")
-    except Exception:
-        pass
+    user_id = await ensure_user_row_for_email(email)
     ok = await set_user_password(user_id, str(body.password))
     if not ok:
-        print("[OTP] Local auth table missing or unavailable; continuing with Supabase auth only")
+        raise HTTPException(
+            status_code=500,
+            detail="Local auth is not configured (apply backend/sql/local_auth.sql)",
+        )
     access_token = issue_access_token(user_id=user_id, email=email)
     return {"ok": True, "access_token": access_token, "token_type": "bearer", "user_id": user_id, "email": email}
 
@@ -470,33 +374,6 @@ async def _get_user_id_by_email_or_sync_from_supabase(email: str) -> str:
             return str(rows[0]["id"])
     except Exception:
         pass
-
-    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
-        try:
-            client = await _get_auth_admin_client()
-            get_user = await client.get(
-                f"{SUPABASE_URL}/auth/v1/admin/users",
-                params={"email": email},
-                headers={
-                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                    "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                },
-            )
-            if get_user.status_code == 200:
-                j = get_user.json()
-                supa_id = None
-                if isinstance(j, dict):
-                    supa_id = j.get("id") or j.get("user", {}).get("id")
-                elif isinstance(j, list) and j:
-                    supa_id = (j[0] or {}).get("id")
-                if supa_id:
-                    try:
-                        await rest_upsert("users", {"id": supa_id, "email": email}, on_conflict="id")
-                    except Exception:
-                        pass
-                    return str(supa_id)
-        except Exception:
-            pass
 
     return await ensure_user_row_for_email(email)
 

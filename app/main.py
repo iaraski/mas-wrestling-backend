@@ -7,30 +7,39 @@ import time
 import os
 import asyncio
 from datetime import datetime
-from app.core.supabase import SUPABASE_URL, SUPABASE_KEY, SUPABASE_SERVICE_ROLE_KEY, admin_supabase
-from app.core.supabase import supabase
 from app.core.cache import cache
+from app.core.db import init_db
+from app.core.rest import rest_get
 
 APP_DEBUG = os.getenv("APP_DEBUG") == "1"
+LEGACY_EXECUTION_ENABLED = os.getenv("LEGACY_EXECUTION_ENABLED") == "1"
 
 # Import routers
 from app.routers import competition, application, brackets, user, locations, bouts, auth, live
 
 async def _warm_cache():
     try:
-        q = supabase.table("locations").select("*").eq("type", "country").order("name")
-        res = await asyncio.to_thread(q.execute)
-        if res and hasattr(res, "data"):
-            cache.set("locations:country:", res.data, ttl_seconds=60.0)
+        resp = await rest_get(
+            "locations",
+            {"select": "*", "type": "eq.country", "order": "name.asc", "limit": "10000"},
+            write=False,
+        )
+        rows = resp.json()
+        if isinstance(rows, list):
+            cache.set("locations:country:", rows, ttl_seconds=60.0)
     except Exception:
         pass
 
     try:
-        q = supabase.table("competitions").select("*, categories:competition_categories(*), locations(name)")
-        res = await asyncio.to_thread(q.execute)
-        if res and hasattr(res, "data"):
+        resp = await rest_get(
+            "competitions",
+            {"select": "*, categories:competition_categories(*), locations(name)", "limit": "10000"},
+            write=False,
+        )
+        rows = resp.json()
+        if isinstance(rows, list):
             data = []
-            for comp in res.data:
+            for comp in rows:
                 if comp.get("locations"):
                     comp["location_name"] = comp["locations"]["name"]
                 data.append(comp)
@@ -39,10 +48,19 @@ async def _warm_cache():
         pass
 
     try:
-        q = supabase.table("competitions").select("*, categories:competition_categories(*)").gte("end_date", datetime.now().isoformat()).order("start_date", desc=False)
-        res = await asyncio.to_thread(q.execute)
-        if res and hasattr(res, "data"):
-            cache.set("competitions:active", res.data, ttl_seconds=15.0)
+        resp = await rest_get(
+            "competitions",
+            {
+                "select": "*, categories:competition_categories(*)",
+                "end_date": f"gte.{datetime.now().isoformat()}",
+                "order": "start_date.asc",
+                "limit": "10000",
+            },
+            write=False,
+        )
+        rows = resp.json()
+        if isinstance(rows, list):
+            cache.set("competitions:active", rows, ttl_seconds=15.0)
     except Exception:
         pass
 
@@ -50,6 +68,7 @@ async def _warm_cache():
 async def lifespan(app: FastAPI):
     if APP_DEBUG:
         print("[FastAPI] Server is starting up...")
+    await init_db()
     warm_task = asyncio.create_task(_warm_cache())
     yield
     warm_task.cancel()
@@ -130,16 +149,19 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 # Include routers
 try:
+    from app.routers import certificates
+    app.include_router(certificates.router, prefix="/api/v1")
     app.include_router(competition.router, prefix="/api/v1")
     app.include_router(application.router, prefix="/api/v1")
-    app.include_router(brackets.router, prefix="/api/v1")
     app.include_router(user.router, prefix="/api/v1")
     app.include_router(locations.router, prefix="/api/v1")
-    app.include_router(bouts.router, prefix="/api/v1")
     app.include_router(auth.router, prefix="/api/v1")
     from app.routers import auth_custom
     app.include_router(auth_custom.router, prefix="/api/v1")
     app.include_router(live.router, prefix="/api/v1")
+    if LEGACY_EXECUTION_ENABLED:
+        app.include_router(brackets.router, prefix="/api/v1")
+        app.include_router(bouts.router, prefix="/api/v1")
     if APP_DEBUG:
         print("ROUTERS CONNECTED SUCCESSFULLY")
 except Exception as e:
@@ -201,12 +223,10 @@ async def debug_env():
     if os.getenv("APP_DEBUG") != "1":
         raise HTTPException(status_code=404, detail="Not Found")
     return {
-        "supabase_url": SUPABASE_URL,
-        "has_supabase_key": bool(SUPABASE_KEY),
-        "supabase_key_len": len(SUPABASE_KEY) if SUPABASE_KEY else 0,
-        "has_service_role_key": bool(SUPABASE_SERVICE_ROLE_KEY),
-        "service_role_key_len": len(SUPABASE_SERVICE_ROLE_KEY) if SUPABASE_SERVICE_ROLE_KEY else 0,
-        "admin_client_ready": bool(admin_supabase),
+        "has_database_url": bool(os.getenv("DATABASE_URL")),
+        "database_url_prefix": (os.getenv("DATABASE_URL") or "")[:32],
+        "has_minio_endpoint": bool(os.getenv("MINIO_ENDPOINT")),
+        "has_minio_bucket": bool(os.getenv("MINIO_BUCKET")),
     }
 
 if __name__ == "__main__":
