@@ -30,16 +30,12 @@ def _now() -> datetime:
 
 async def get_row(email: str) -> Optional[Dict[str, Any]]:
     try:
-        resp = await rest_get(
-            "otp_codes",
-            {
-                "select": "email,code_hash,expires_at,attempts,last_sent_at",
-                "email": f"eq.{email}",
-                "limit": "1",
-            },
-            write=True,
-        )
-        data = resp.json()
+        from app.core.supabase import admin_supabase
+        resp = await admin_supabase.table("otp_codes").select(
+            "email,code_hash,expires_at,attempts,last_sent_at"
+        ).eq("email", email).limit(1).execute_async()
+        
+        data = resp.data
         if isinstance(data, list) and data:
             return data[0]
         return None
@@ -61,30 +57,27 @@ async def can_send(email: str, min_interval_seconds: int = 60) -> bool:
 
 async def delete(email: str) -> None:
     try:
-        await rest_delete("otp_codes", {"email": f"eq.{email}"})
+        from app.core.supabase import admin_supabase
+        await admin_supabase.table("otp_codes").delete().eq("email", email).execute_async()
     except Exception:
         return
 
 def _run(coro):
-    # Instead of creating a new loop that might conflict with the connection pool's thread loop,
-    # we either use the existing loop or run properly.
+    # Running async code from a sync context when an event loop already exists 
+    # (e.g. inside FastAPI threadpool) is problematic.
+    # To fix this without breaking the pool, we just use the global event loop 
+    # and run the coroutine in a threadsafe way.
     try:
         loop = asyncio.get_running_loop()
-        # We are already in an event loop, we can just run the coroutine using create_task 
-        # or wait for it. Since this is a sync wrapper, we must block.
-        # But blocking an async loop from inside is bad.
         raise RuntimeError("OTP sync functions must be called from a non-async thread")
     except RuntimeError as e:
         if "no running event loop" not in str(e).lower():
             raise
-    
-    # Using asyncio.run() creates a new event loop, which breaks SQLAlchemy's asyncpg connection pool
-    # because the pool's connections are bound to the original loop.
-    # To fix this, we should use anyio or a global loop, but since FastAPI runs this in a threadpool,
-    # we can create a new loop but we MUST NOT use the global connection pool from it directly 
-    # without proper cleanup, or better yet, avoid sync wrappers for DB operations.
-    
-    # For now, we will create a new loop and run the coro.
+            
+    # We are in a pure sync thread. Let's create a new loop just for this.
+    # WARNING: this will create a new asyncpg connection pool internally 
+    # because SQLAlchemy async_engine creates pool per loop. 
+    # A better approach is to avoid sync functions for DB operations.
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -123,17 +116,17 @@ async def store(email: str, code: str, ttl_seconds: int = 600) -> None:
         else:
             code_hash = f"{new_hash}|{prev_parts[0]}"
     try:
-        await rest_upsert(
-            "otp_codes",
+        from app.core.supabase import admin_supabase
+        await admin_supabase.table("otp_codes").upsert(
             {
                 "email": email,
                 "code_hash": code_hash,
-                "expires_at": expires.isoformat(),
+                "expires_at": expires,
                 "attempts": 0,
-                "last_sent_at": _now().isoformat(),
+                "last_sent_at": _now(),
             },
-            on_conflict="email",
-        )
+            on_conflict="email"
+        ).execute_async()
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"OTP storage unavailable: {type(e).__name__}") from e
 
@@ -155,7 +148,8 @@ async def consume(email: str, code: str, max_attempts: int = 5) -> None:
         exp = _now() - timedelta(seconds=1)
     if _now() > exp:
         try:
-            await rest_delete("otp_codes", {"email": f"eq.{email}"})
+            from app.core.supabase import admin_supabase
+            await admin_supabase.table("otp_codes").delete().eq("email", email).execute_async()
         except Exception:
             pass
         raise HTTPException(status_code=400, detail="Неверный или истёкший код")
@@ -170,17 +164,16 @@ async def consume(email: str, code: str, max_attempts: int = 5) -> None:
     if not ok:
         new_attempts = attempts + 1
         try:
-            await rest_patch(
-                "otp_codes",
-                {"email": f"eq.{email}"},
-                {"attempts": new_attempts},
-                prefer="return=minimal",
-            )
+            from app.core.supabase import admin_supabase
+            await admin_supabase.table("otp_codes").update(
+                {"attempts": new_attempts}
+            ).eq("email", email).execute_async()
         except Exception:
             pass
         raise HTTPException(status_code=400, detail="Неверный или истёкший код")
 
     try:
-        await rest_delete("otp_codes", {"email": f"eq.{email}"})
+        from app.core.supabase import admin_supabase
+        await admin_supabase.table("otp_codes").delete().eq("email", email).execute_async()
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"OTP storage unavailable: {type(e).__name__}") from e
