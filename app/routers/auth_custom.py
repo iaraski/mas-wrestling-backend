@@ -314,10 +314,28 @@ async def send_otp(body: SendOtpBody):
 @router.post("/otp/verify")
 async def verify_otp(body: VerifyOtpBody):
     email = _normalize_email(body.email)
+    
+    # Run OTP verification
     await otp_consume_db(email, body.code, max_attempts=5)
+    
     if not body.password or len(str(body.password)) < 8:
         raise HTTPException(status_code=400, detail="Пароль должен быть не короче 8 символов")
-    user_id = await ensure_user_row_for_email(email)
+        
+    # Get or create user
+    try:
+        from app.core.supabase import admin_supabase
+        resp = await admin_supabase.table("users").select("id").eq("email", email).limit(1).execute_async()
+        data = resp.data
+        if data and isinstance(data, list) and data[0].get("id"):
+            user_id = str(data[0]["id"])
+        else:
+            # Create user directly using supabase to avoid rest_get overhead
+            import uuid
+            user_id = str(uuid.uuid4())
+            await admin_supabase.table("users").upsert({"id": user_id, "email": email}, on_conflict="id").execute_async()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error during user fetch: {e}")
+        
     ok = await set_user_password(user_id, str(body.password))
     if not ok:
         raise HTTPException(

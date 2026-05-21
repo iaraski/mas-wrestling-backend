@@ -130,7 +130,8 @@ async def set_user_password(user_id: str, password: str) -> bool:
         "iterations": int(iters),
     }
     try:
-        await rest_upsert("auth_passwords", payload, on_conflict="user_id")
+        from app.core.supabase import admin_supabase
+        await admin_supabase.table("auth_passwords").upsert(payload, on_conflict="user_id").execute_async()
         return True
     except Exception:
         return False

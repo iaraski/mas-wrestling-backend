@@ -170,7 +170,7 @@ async def consume(email: str, code: str, max_attempts: int = 5) -> None:
             ).eq("email", email).execute_async()
         except Exception:
             pass
-        raise HTTPException(status_code=400, detail="Неверный или истёкший код")
+        raise HTTPException(status_code=400, detail="Неверный код")
 
     try:
         from app.core.supabase import admin_supabase

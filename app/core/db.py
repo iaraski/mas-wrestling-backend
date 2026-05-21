@@ -1,5 +1,6 @@
 import os
 import asyncio
+import sqlalchemy.pool
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -23,12 +24,11 @@ connect_args: dict = {}
 if DATABASE_SSL in {"disable", "disabled", "false", "0", "no"}:
     connect_args["ssl"] = False
 
+from sqlalchemy.pool import NullPool
+
 engine: AsyncEngine = create_async_engine(
     DATABASE_URL,
-    pool_pre_ping=True,
-    pool_recycle=1800,  # Recycle connections every 30 minutes to prevent idle drops
-    pool_size=10,
-    max_overflow=20,
+    poolclass=NullPool,
     connect_args=connect_args or None,
 )
 
