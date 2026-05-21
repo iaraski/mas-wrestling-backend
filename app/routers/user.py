@@ -1147,7 +1147,16 @@ async def submit_my_profile(
 
     passport_payload: dict[str, object] = {"athlete_id": athlete_id}
     if birth_date is not None:
-        passport_payload["birth_date"] = str(birth_date).strip() or None
+        bd_str = str(birth_date).strip()
+        if bd_str:
+            try:
+                import datetime
+                datetime.date.fromisoformat(bd_str)
+                passport_payload["birth_date"] = bd_str
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid birth_date format, expected YYYY-MM-DD")
+        else:
+            passport_payload["birth_date"] = None
     if gender is not None:
         passport_payload["gender"] = str(gender).strip() or None
     if rank is not None:
@@ -1156,7 +1165,8 @@ async def submit_my_profile(
         passport_payload["photo_url"] = final_photo_url
 
     try:
-        await rest_upsert("passports", passport_payload, on_conflict="athlete_id")
+        from app.core.supabase import admin_supabase
+        await admin_supabase.table("passports").upsert(passport_payload, on_conflict="athlete_id").execute_async()
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to upsert passports: {repr(e)}")
 
