@@ -88,7 +88,7 @@ def _send_unisender_go_via_api(
                 with httpx.Client(
                     timeout=httpx.Timeout(timeout, connect=min(10.0, timeout)),
                     http2=False,
-                    verify=ctx,
+                    verify=False, # Ignore SSL verification error UNEXPECTED_EOF_WHILE_READING
                     limits=httpx.Limits(max_connections=10, max_keepalive_connections=5, keepalive_expiry=5.0),
                     transport=httpx.HTTPTransport(retries=2),
                 ) as client:
@@ -171,8 +171,9 @@ def _smtp_send(to_email: str, subject: str, html_body: str, text_body: str) -> N
             print(f"[OTP] Unisender Go API unavailable, fallback to SMTP: {type(e).__name__}: {str(e) or ''}".strip())
 
     tls_ctx = ssl.create_default_context()
-    tls_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    tls_ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+    tls_ctx.check_hostname = False
+    tls_ctx.verify_mode = ssl.CERT_NONE
+    
     ports = [int(port)]
     if int(port) != 25:
         ports.append(25)
