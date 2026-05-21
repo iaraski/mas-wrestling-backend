@@ -98,6 +98,10 @@ def _send_unisender_go_via_api(
                     return
                 msg = (resp.text or "").strip()
                 raise RuntimeError(f"API {resp.status_code}: {msg[:500]}")
+            except httpx.ConnectError as e:
+                last_exc = e
+                print(f"[OTP] Unisender Go API send failed url={url}: ConnectError: {str(e) or ''}".strip())
+                continue
             except Exception as e:
                 last_exc = e
                 print(f"[OTP] Unisender Go API send failed url={url}: {type(e).__name__}: {str(e) or ''}".strip())
@@ -174,9 +178,17 @@ def _smtp_send(to_email: str, subject: str, html_body: str, text_body: str) -> N
     tls_ctx.check_hostname = False
     tls_ctx.verify_mode = ssl.CERT_NONE
     
+    # Try different ports for SMTP fallback
     ports = [int(port)]
-    if int(port) != 25:
-        ports.append(25)
+    if int(port) not in [25, 465, 587, 2525]:
+        ports.extend([587, 25, 465, 2525])
+    elif int(port) == 587:
+        ports.extend([25, 465, 2525])
+    elif int(port) == 25:
+        ports.extend([587, 465, 2525])
+        
+    # Remove duplicates but keep order
+    ports = list(dict.fromkeys(ports))
 
     for attempt in range(retries + 1):
         try:
