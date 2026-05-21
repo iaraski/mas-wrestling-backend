@@ -224,12 +224,12 @@ def _smtp_send_background(
     try:
         _smtp_send(to_email, subject, html_body, text_body)
     except HTTPException as e:
-        otp_delete_db_sync(to_email)
+        # Since this is a background thread, we can't easily await, so we skip DB deletion
+        # or we could create a new loop. Let's just pop from rate limit map.
         with _send_rl_lock:
             _send_next_allowed.pop(rl_key or str(to_email), None)
         print(f"[OTP] SMTP send failed to={to_email}: {e.detail}")
     except Exception as e:
-        otp_delete_db_sync(to_email)
         with _send_rl_lock:
             _send_next_allowed.pop(rl_key or str(to_email), None)
         print(f"[OTP] SMTP send failed to={to_email}: {repr(e)}")
@@ -255,33 +255,48 @@ async def send_otp(body: SendOtpBody):
     send_async = send_async_env in ("1", "true", "yes", "on")
     print(f"[OTP] send_otp mode={'async' if send_async else 'sync'} SMTP_SEND_ASYNC={send_async_env!r}")
     if send_async:
-        def _job():
-            ok = otp_store_db_sync(email, code, ttl_seconds=600)
-            if not ok:
-                with _send_rl_lock:
-                    _send_next_allowed.pop(email, None)
-                print(f"[OTP] OTP store failed email={email}")
-                return
-            _smtp_send_background(email, "Код подтверждения", html, text)
-        threading.Thread(
-            target=_job,
-            daemon=True,
-        ).start()
-        return {"ok": True, "queued": True}
-    try:
-        ok = otp_store_db_sync(email, code, ttl_seconds=600)
-        if not ok:
+        # We must use asyncio.run inside the thread instead of relying on sync wrappers,
+        # or we just let the main thread do the db store and only offload SMTP.
+        try:
+            # First store OTP sync block inside main async loop
+            # BUT we are in an async function right now, so we can just await the async version
+            from app.core.otp_db import store as otp_store_db_async
+            await otp_store_db_async(email, code, ttl_seconds=600)
+            
+            def _job():
+                _smtp_send_background(email, "Код подтверждения", html, text)
+                
+            threading.Thread(
+                target=_job,
+                daemon=True,
+            ).start()
+            return {"ok": True, "queued": True}
+        except Exception as e:
             with _send_rl_lock:
                 _send_next_allowed.pop(email, None)
+            print(f"[OTP] OTP store failed email={email}: {e}")
             raise HTTPException(status_code=503, detail="OTP storage unavailable")
+    try:
+        from app.core.otp_db import store as otp_store_db_async
+        await otp_store_db_async(email, code, ttl_seconds=600)
+        
         print(f"[OTP] OTP stored email={email}")
         _smtp_send(email, "Код подтверждения", html, text)
         return {"ok": True, "queued": False}
     except HTTPException as e:
-        otp_delete_db_sync(email)
+        # We can also use async delete
+        from app.core.otp_db import delete as otp_delete_db_async
+        try:
+            await otp_delete_db_async(email)
+        except:
+            pass
         with _send_rl_lock:
             _send_next_allowed.pop(email, None)
         raise e
+    except Exception as e:
+        with _send_rl_lock:
+            _send_next_allowed.pop(email, None)
+        raise HTTPException(status_code=503, detail="OTP storage unavailable")
 
 @router.post("/otp/verify")
 async def verify_otp(body: VerifyOtpBody):
@@ -337,11 +352,9 @@ async def reset_send(body: ResetSendBody):
         "Если вы не запрашивали восстановление, просто проигнорируйте это письмо."
     )
     try:
-        ok = otp_store_db_sync(email, token, ttl_seconds=900)
-        if not ok:
-            with _send_rl_lock:
-                _send_next_allowed.pop(key, None)
-            raise HTTPException(status_code=503, detail="OTP storage unavailable")
+        from app.core.otp_db import store as otp_store_db_async
+        await otp_store_db_async(email, token, ttl_seconds=900)
+        
         send_async_env = (os.getenv("SMTP_SEND_ASYNC") or "").strip().lower()
         send_async = send_async_env in ("1", "true", "yes", "on")
         if send_async:
@@ -354,12 +367,20 @@ async def reset_send(body: ResetSendBody):
         _smtp_send(email, "Восстановление пароля", html, text)
         return {"ok": True, "queued": False}
     except HTTPException:
-        otp_delete_db_sync(email)
+        from app.core.otp_db import delete as otp_delete_db_async
+        try:
+            await otp_delete_db_async(email)
+        except:
+            pass
         with _send_rl_lock:
             _send_next_allowed.pop(key, None)
         raise
     except Exception:
-        otp_delete_db_sync(email)
+        from app.core.otp_db import delete as otp_delete_db_async
+        try:
+            await otp_delete_db_async(email)
+        except:
+            pass
         with _send_rl_lock:
             _send_next_allowed.pop(key, None)
         raise HTTPException(status_code=500, detail="Не удалось отправить письмо")

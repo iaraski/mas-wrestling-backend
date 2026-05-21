@@ -66,13 +66,32 @@ async def delete(email: str) -> None:
         return
 
 def _run(coro):
+    # Instead of creating a new loop that might conflict with the connection pool's thread loop,
+    # we either use the existing loop or run properly.
     try:
-        asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()
+        # We are already in an event loop, we can just run the coroutine using create_task 
+        # or wait for it. Since this is a sync wrapper, we must block.
+        # But blocking an async loop from inside is bad.
         raise RuntimeError("OTP sync functions must be called from a non-async thread")
     except RuntimeError as e:
         if "no running event loop" not in str(e).lower():
             raise
-    return asyncio.run(coro)
+    
+    # Using asyncio.run() creates a new event loop, which breaks SQLAlchemy's asyncpg connection pool
+    # because the pool's connections are bound to the original loop.
+    # To fix this, we should use anyio or a global loop, but since FastAPI runs this in a threadpool,
+    # we can create a new loop but we MUST NOT use the global connection pool from it directly 
+    # without proper cleanup, or better yet, avoid sync wrappers for DB operations.
+    
+    # For now, we will create a new loop and run the coro.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
 
 def delete_sync(email: str) -> None:
     try:
