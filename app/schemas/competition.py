@@ -5,6 +5,7 @@ from uuid import UUID
 
 # 1. Схемы для Категорий (возрастные и весовые)
 class CategoryBase(BaseModel):
+    id: Optional[UUID] = None
     gender: str
     age_min: int
     age_max: int

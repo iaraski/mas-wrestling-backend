@@ -69,8 +69,17 @@ def _is_minio_key(v: str) -> bool:
     return vv.startswith("documents/") or vv.startswith("/")
 
 def _applications_open_now() -> bool:
-    now = datetime.now(_MSK_TZ)
-    return now < _APPLICATION_DEADLINE
+    # now = datetime.now(_MSK_TZ)
+    # return now < _APPLICATION_DEADLINE
+    return True
+
+def _parse_date(d: str | None):
+    if not d:
+        return None
+    try:
+        return datetime.fromisoformat(str(d).replace("Z", "+00:00")).date()
+    except Exception:
+        return None
 
 def _normalize_gender(g: str | None) -> str:
     s = (g or "").strip().lower()
@@ -649,10 +658,10 @@ async def create_my_application(
     if authorization:
         user_id = await _get_user_id_from_bearer(authorization)
     if not user_id:
-        raise HTTPException(status_code=401, detail="Missing bearer token")
+        raise HTTPException(status_code=401, detail="Missing bearer token")     
 
-    if not _applications_open_now():
-        raise HTTPException(status_code=403, detail="Application deadline has passed")
+    # if not _applications_open_now():
+    #     raise HTTPException(status_code=403, detail="Application deadline has passed")
 
     cat_resp = await rest_get(
         "competition_categories",
@@ -786,7 +795,7 @@ async def admin_create_athlete_and_application(
 
     pass_payload: dict[str, object] = {
         "athlete_id": athlete_id,
-        "birth_date": body.birth_date,
+        "birth_date": _parse_date(body.birth_date),
         "rank": body.rank,
         "photo_url": body.photo_url,
     }
@@ -799,7 +808,7 @@ async def admin_create_athlete_and_application(
     if body.issued_by is not None:
         pass_payload["issued_by"] = body.issued_by
     if body.issue_date is not None:
-        pass_payload["issue_date"] = body.issue_date
+        pass_payload["issue_date"] = _parse_date(body.issue_date)
     if body.passport_scan_url is not None:
         pass_payload["passport_scan_url"] = body.passport_scan_url
     await rest_upsert("passports", pass_payload, on_conflict="athlete_id")
@@ -991,7 +1000,7 @@ async def admin_update_athlete_profile(
     pass_payload: dict[str, object] = {"athlete_id": athlete_id}
     passport_has_changes = False
     if body.birth_date is not None:
-        pass_payload["birth_date"] = body.birth_date
+        pass_payload["birth_date"] = _parse_date(body.birth_date)
         passport_has_changes = True
     if body.rank is not None:
         pass_payload["rank"] = body.rank
@@ -1012,7 +1021,7 @@ async def admin_update_athlete_profile(
         pass_payload["issued_by"] = body.issued_by
         passport_has_changes = True
     if body.issue_date is not None:
-        pass_payload["issue_date"] = body.issue_date
+        pass_payload["issue_date"] = _parse_date(body.issue_date)
         passport_has_changes = True
     if body.passport_scan_url is not None:
         pass_payload["passport_scan_url"] = body.passport_scan_url

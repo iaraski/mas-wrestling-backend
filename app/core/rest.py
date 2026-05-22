@@ -23,13 +23,42 @@ def _parse_param(table, key: str, raw: Any):
     if s.startswith("neq."):
         return table.c[key] != s[4:]
     if s.startswith("gte."):
-        return table.c[key] >= s[4:]
+        # Cast to datetime if the column is a datetime type to avoid asyncpg type errors
+        val = s[4:]
+        if "time" in str(table.c[key].type).lower():
+            try:
+                from datetime import datetime
+                val = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            except:
+                pass
+        return table.c[key] >= val
     if s.startswith("gt."):
-        return table.c[key] > s[3:]
+        val = s[3:]
+        if "time" in str(table.c[key].type).lower():
+            try:
+                from datetime import datetime
+                val = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            except:
+                pass
+        return table.c[key] > val
     if s.startswith("lte."):
-        return table.c[key] <= s[4:]
+        val = s[4:]
+        if "time" in str(table.c[key].type).lower():
+            try:
+                from datetime import datetime
+                val = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            except:
+                pass
+        return table.c[key] <= val
     if s.startswith("lt."):
-        return table.c[key] < s[3:]
+        val = s[3:]
+        if "time" in str(table.c[key].type).lower():
+            try:
+                from datetime import datetime
+                val = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            except:
+                pass
+        return table.c[key] < val
     if s.startswith("ilike."):
         return table.c[key].ilike(s[6:])
     if s.startswith("in.(") and s.endswith(")"):

@@ -18,16 +18,19 @@ from sqlalchemy import select
 
 router = APIRouter(prefix="/competitions", tags=["competitions"])
 
-def _norm_iso(dt: str | datetime | None) -> str | None:
+def _norm_datetime(dt: str | datetime | None) -> datetime | None:
     if dt is None:
         return None
     if isinstance(dt, datetime):
-        return dt.isoformat().replace("+00:00", "Z")
+        # ensure it's timezone-aware if needed, but SQLAlchemy TIMESTAMP WITH TIME ZONE handles naive objects assuming UTC if configured,
+        # but let's just parse strings
+        return dt
     try:
+        # Parse from string, adding timezone info if missing, or just using fromisoformat
         parsed = datetime.fromisoformat(str(dt).replace("Z", "+00:00"))
-        return parsed.isoformat().replace("+00:00", "Z")
+        return parsed
     except Exception:
-        return str(dt)
+        return None
 
 def _cat_key(cat: dict) -> tuple:
     gender = (cat.get("gender") or "").lower()
@@ -38,8 +41,8 @@ def _cat_key(cat: dict) -> tuple:
     wmax = float(wmax) if wmax is not None else None
     if wmax is not None and abs(wmax - 999.0) < 1e-6:
         wmax = 999.0
-    day = _norm_iso(cat.get("competition_day"))
-    mandate = _norm_iso(cat.get("mandate_day"))
+    day = _norm_datetime(cat.get("competition_day"))
+    mandate = _norm_datetime(cat.get("mandate_day"))
     return (
         gender,
         age_min,
@@ -115,9 +118,28 @@ async def create_competition(comp: CompetitionCreate):
         if not comp_data.get("preview_url"):
             comp_data.pop("preview_url", None)
         
+        # Format dates
+        if "start_date" in comp_data:
+            comp_data["start_date"] = _norm_datetime(comp_data["start_date"])
+        if "end_date" in comp_data:
+            comp_data["end_date"] = _norm_datetime(comp_data["end_date"])
+        if "mandate_start_date" in comp_data:
+            comp_data["mandate_start_date"] = _norm_datetime(comp_data["mandate_start_date"])
+        if "mandate_end_date" in comp_data:
+            comp_data["mandate_end_date"] = _norm_datetime(comp_data["mandate_end_date"])
+
         # Convert UUIDs to strings
-        if "location_id" in comp_data and comp_data["location_id"]:
+        if "location_id" in comp_data and comp_data["location_id"] is not None:
             comp_data["location_id"] = str(comp_data["location_id"])
+        if "certificate_template_id" in comp_data and comp_data["certificate_template_id"] is not None:
+            comp_data["certificate_template_id"] = str(comp_data["certificate_template_id"])
+        
+        # FIX: force dates back to parsed isoformat if model_dump converted them to strings
+        # because asyncpg strict mode requires real python datetime objects, not strings.
+        for dfield in ["start_date", "end_date", "mandate_start_date", "mandate_end_date"]:
+            if comp_data.get(dfield):
+                if isinstance(comp_data[dfield], str):
+                    comp_data[dfield] = _norm_datetime(comp_data[dfield])
 
         print(f"[Backend] Creating competition: {comp_data['name']}")
 
@@ -136,7 +158,7 @@ async def create_competition(comp: CompetitionCreate):
         if comp.categories:
             categories_data = []
             for cat in comp.categories:
-                cat_dict = cat.model_dump()
+                cat_dict = cat.model_dump(exclude_none=True)
                 cat_dict["competition_id"] = new_comp["id"]
                 
                 # Make sure string dates are parsed to datetime if they come as string
@@ -205,15 +227,12 @@ async def update_competition(comp_id: UUID, comp_update: CompetitionUpdate):
         categories_data = update_data.pop("categories", None)
         secretaries_data = update_data.pop("secretaries", None)
         
-        # Сериализация UUID для основной таблицы
-        for key, value in update_data.items():
+        # Сериализация UUID и дат для основной таблицы
+        for key, value in list(update_data.items()):
             if isinstance(value, UUID):
                 update_data[key] = str(value)
-            elif isinstance(value, str) and key in ["mandate_start_date", "mandate_end_date", "start_date", "end_date"]:
-                try:
-                    update_data[key] = datetime.fromisoformat(value.replace("Z", "+00:00"))
-                except ValueError:
-                    pass
+            elif key in ["mandate_start_date", "mandate_end_date", "start_date", "end_date"]:
+                update_data[key] = _norm_datetime(value)
 
         # Обновление основной таблицы соревнований
         if update_data:
@@ -280,7 +299,7 @@ async def update_competition(comp_id: UUID, comp_update: CompetitionUpdate):
             # Вставляем новые и обновляем существующие
             if categories_data:
                 for cat in categories_data:
-                    cat_dict = cat if isinstance(cat, dict) else cat.model_dump()
+                    cat_dict = cat if isinstance(cat, dict) else cat.model_dump(exclude_none=True)
                     cat_dict["competition_id"] = comp_id_str
                     
                     for d_field in ["competition_day", "mandate_day"]:
@@ -388,6 +407,28 @@ async def update_competition(comp_id: UUID, comp_update: CompetitionUpdate):
     except Exception as e:
         print(f"[Backend] ERROR in update_competition: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/{comp_id}")
+async def delete_competition(comp_id: UUID):
+    cid = str(comp_id)
+    try:
+        from app.core.supabase import admin_supabase
+        if not admin_supabase:
+            raise HTTPException(status_code=500, detail="admin_supabase is not initialized")
+        
+        # Fast SQL delete
+        await _execute(admin_supabase.table("competition_bouts").delete().eq("competition_id", cid))
+        await _execute(admin_supabase.table("competition_mats").delete().eq("competition_id", cid))
+        await _execute(admin_supabase.table("competition_category_assignments").delete().eq("competition_id", cid))
+        await _execute(admin_supabase.table("applications").delete().eq("competition_id", cid))
+        await _execute(admin_supabase.table("competition_categories").delete().eq("competition_id", cid))
+        await _execute(admin_supabase.table("competition_secretaries").delete().eq("competition_id", cid))
+        
+        await _execute(admin_supabase.table("competitions").delete().eq("id", cid))
+        cache.invalidate_prefix("competitions:")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True}
 
 @router.post("/{comp_id}/preview")
 async def upload_competition_preview(comp_id: UUID, file: UploadFile = File(...)):

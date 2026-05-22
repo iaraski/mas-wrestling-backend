@@ -1151,8 +1151,8 @@ async def submit_my_profile(
         if bd_str:
             try:
                 import datetime
-                datetime.date.fromisoformat(bd_str)
-                passport_payload["birth_date"] = bd_str
+                dt = datetime.date.fromisoformat(bd_str)
+                passport_payload["birth_date"] = dt
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid birth_date format, expected YYYY-MM-DD")
         else:
@@ -1165,7 +1165,6 @@ async def submit_my_profile(
         passport_payload["photo_url"] = final_photo_url
 
     try:
-        from app.core.supabase import admin_supabase
         await admin_supabase.table("passports").upsert(passport_payload, on_conflict="athlete_id").execute_async()
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to upsert passports: {repr(e)}")
@@ -1250,7 +1249,7 @@ async def get_my_applications(authorization: str | None = Header(default=None)):
         apps_resp = await rest_get(
             "applications",
             {
-                "select": "id,status,draw_number,created_at,category_id,competitions(id,name,start_date),competition_categories(gender,age_min,age_max,weight_min,weight_max)",
+                "select": "id,status,draw_number,created_at,category_id,competition_id",
                 "athlete_id": f"eq.{athlete_id}",
                 "order": "created_at.desc",
                 "limit": "1000",
@@ -1258,8 +1257,43 @@ async def get_my_applications(authorization: str | None = Header(default=None)):
             write=True,
         )
         rows = apps_resp.json()
-        return rows if isinstance(rows, list) else []
-    except Exception:
+        if not isinstance(rows, list):
+            return []
+
+        cat_ids = {str(r.get("category_id")) for r in rows if r.get("category_id")}
+        comp_ids = {str(r.get("competition_id")) for r in rows if r.get("competition_id")}
+
+        cats_map = {}
+        if cat_ids:
+            from sqlalchemy import select as _select
+            from app.core.db import SessionLocal, tables
+            cats_t = tables.get("competition_categories")
+            if cats_t is not None:
+                async with SessionLocal() as session:
+                    cat_res = await session.execute(_select(cats_t).where(cats_t.c.id.in_(list(cat_ids))))
+                    for r in cat_res.mappings().all():
+                        cats_map[str(r.get("id"))] = dict(r)
+
+        comps_map = {}
+        if comp_ids:
+            from sqlalchemy import select as _select
+            from app.core.db import SessionLocal, tables
+            comps_t = tables.get("competitions")
+            if comps_t is not None:
+                async with SessionLocal() as session:
+                    c_res = await session.execute(_select(comps_t.c.id, comps_t.c.name, comps_t.c.start_date).where(comps_t.c.id.in_(list(comp_ids))))
+                    for r in c_res.mappings().all():
+                        comps_map[str(r.get("id"))] = dict(r)
+
+        for app in rows:
+            cat_id = str(app.get("category_id")) if app.get("category_id") else ""
+            comp_id = str(app.get("competition_id")) if app.get("competition_id") else ""
+            app["competition_categories"] = cats_map.get(cat_id)
+            app["competitions"] = comps_map.get(comp_id)
+
+        return rows
+    except Exception as e:
+        print(f"Error in get_my_applications: {e}")
         return []
 
 @router.post("/admin-create/", response_model=UserProfile)
