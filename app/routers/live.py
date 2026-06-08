@@ -879,6 +879,22 @@ async def _advance_double_elim_for_category(
                     if not ids:
                         return
                     pool = list(ids)
+
+                    # Lookahead for 4 participants to prevent 2 byes due to greedy mismatch
+                    # Often happens in LB when 2 WB losers meet 2 LB survivors
+                    if len(pool) == 4:
+                        p0, p1, p2, p3 = pool
+                        m1 = _pair_key(p0, p1) not in forbidden and _pair_key(p2, p3) not in forbidden
+                        m2 = _pair_key(p0, p2) not in forbidden and _pair_key(p1, p3) not in forbidden
+                        m3 = _pair_key(p0, p3) not in forbidden and _pair_key(p1, p2) not in forbidden
+                        
+                        if m1:
+                            pass
+                        elif m2:
+                            pool = [p0, p2, p1, p3]
+                        elif m3:
+                            pool = [p0, p3, p1, p2]
+
                     while pool:
                         a_id = pool.pop(0)
                         if not pool:
