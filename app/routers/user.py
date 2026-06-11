@@ -1086,7 +1086,10 @@ async def submit_my_profile(
         loc = str(location_id).strip()
         profile_payload["location_id"] = loc or None
 
-    await _execute(admin_supabase.table("profiles").upsert(profile_payload, on_conflict="user_id"))
+    try:
+        await _execute(admin_supabase.table("profiles").upsert(profile_payload, on_conflict="user_id"))
+    except HTTPException as e:
+        raise HTTPException(status_code=e.status_code, detail=f"Profiles upsert failed: {e.detail}")
     try:
         await rest_upsert("profiles", profile_payload, on_conflict="user_id")
     except Exception:
@@ -1097,12 +1100,15 @@ async def submit_my_profile(
         await rest_upsert("athletes", ath_payload, on_conflict="user_id")
         ath_data = ath_payload | {"id": None}
     except Exception:
-        ath_res = await _execute(
-            admin_supabase.table("athletes").upsert(
-                {"user_id": user_id, "coach_name": coach_name},
-                on_conflict="user_id",
+        try:
+            ath_res = await _execute(
+                admin_supabase.table("athletes").upsert(
+                    {"user_id": user_id, "coach_name": coach_name},
+                    on_conflict="user_id",
+                )
             )
-        )
+        except HTTPException as e:
+            raise HTTPException(status_code=e.status_code, detail=f"Athletes upsert failed: {e.detail}")
         ath_data = _safe_data(ath_res)
     athlete_id = None
     if isinstance(ath_data, list) and ath_data:
@@ -1111,7 +1117,10 @@ async def submit_my_profile(
         athlete_id = str(ath_data.get("id")) if ath_data.get("id") else None
     if not athlete_id or athlete_id == "None":
         athlete_q = admin_supabase.table("athletes").select("id").eq("user_id", user_id).maybe_single()
-        athlete_res = await _execute(athlete_q)
+        try:
+            athlete_res = await _execute(athlete_q)
+        except HTTPException as e:
+            raise HTTPException(status_code=e.status_code, detail=f"Athlete lookup failed: {e.detail}")
         athlete_row = _safe_data(athlete_res)
         if not athlete_row:
             raise HTTPException(status_code=500, detail="Athlete upsert failed")
