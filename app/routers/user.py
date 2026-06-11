@@ -1095,27 +1095,33 @@ async def submit_my_profile(
     except Exception:
         pass
 
-    ath_payload = {"user_id": user_id, "coach_name": coach_name}
-    try:
-        await rest_upsert("athletes", ath_payload, on_conflict="user_id")
-        ath_data = ath_payload | {"id": None}
-    except Exception:
-        try:
-            ath_res = await _execute(
-                admin_supabase.table("athletes").upsert(
-                    {"user_id": user_id, "coach_name": coach_name},
-                    on_conflict="user_id",
-                )
-            )
-        except HTTPException as e:
-            raise HTTPException(status_code=e.status_code, detail=f"Athletes upsert failed: {e.detail}")
-        ath_data = _safe_data(ath_res)
     athlete_id = None
-    if isinstance(ath_data, list) and ath_data:
-        athlete_id = str(ath_data[0].get("id")) if isinstance(ath_data[0], dict) else None
-    elif isinstance(ath_data, dict):
-        athlete_id = str(ath_data.get("id")) if ath_data.get("id") else None
-    if not athlete_id or athlete_id == "None":
+    athlete_q = admin_supabase.table("athletes").select("id,coach_name").eq("user_id", user_id).maybe_single()
+    try:
+        athlete_res = await _execute(athlete_q)
+    except HTTPException as e:
+        raise HTTPException(status_code=e.status_code, detail=f"Athlete lookup failed: {e.detail}")
+    athlete_row = _safe_data(athlete_res)
+    if isinstance(athlete_row, dict) and athlete_row.get("id"):
+        athlete_id = str(athlete_row["id"])
+        if coach_name is not None:
+            try:
+                await _execute(
+                    admin_supabase.table("athletes")
+                    .update({"coach_name": coach_name})
+                    .eq("id", athlete_id)
+                )
+            except HTTPException as e:
+                raise HTTPException(status_code=e.status_code, detail=f"Athletes update failed: {e.detail}")
+    else:
+        insert_payload = {"id": str(uuid4()), "user_id": user_id, "coach_name": coach_name}
+        try:
+            await _execute(admin_supabase.table("athletes").insert(insert_payload))
+        except HTTPException as e:
+            detail = str(e.detail)
+            lowered = detail.lower()
+            if "integrityerror" not in lowered and "duplicate" not in lowered and "unique" not in lowered:
+                raise HTTPException(status_code=e.status_code, detail=f"Athletes insert failed: {e.detail}")
         athlete_q = admin_supabase.table("athletes").select("id").eq("user_id", user_id).maybe_single()
         try:
             athlete_res = await _execute(athlete_q)
@@ -1123,7 +1129,7 @@ async def submit_my_profile(
             raise HTTPException(status_code=e.status_code, detail=f"Athlete lookup failed: {e.detail}")
         athlete_row = _safe_data(athlete_res)
         if not athlete_row:
-            raise HTTPException(status_code=500, detail="Athlete upsert failed")
+            raise HTTPException(status_code=500, detail="Athlete create failed")
         athlete_id = str(athlete_row["id"])
 
     final_photo_url = str(photo_url).strip() if photo_url else None
