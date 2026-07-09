@@ -13,6 +13,7 @@ from uuid import uuid4
 from app.core.supabase import supabase, admin_supabase
 from app.core.cache import cache
 from app.core.local_auth import get_user_id_from_bearer
+from app.core.roles import get_role_codes
 
 
 router = APIRouter(prefix="/live", tags=["live"])
@@ -3730,14 +3731,7 @@ async def stop_live_competition(
         raise HTTPException(status_code=500, detail="Service role not configured")
 
     user_id = await get_user_id_from_bearer(authorization)
-    roles_res = await _execute(
-        admin_supabase.table("user_roles").select("roles(code)").eq("user_id", str(user_id)).limit(50)
-    )
-    role_codes = [
-        ur.get("roles", {}).get("code")
-        for ur in (roles_res.data or [])
-        if isinstance(ur, dict) and isinstance(ur.get("roles"), dict) and ur.get("roles", {}).get("code")
-    ]
+    role_codes = await get_role_codes(str(user_id))
     allowed = any(c in ("founder", "admin", "country_admin", "region_admin") for c in role_codes)
     if not allowed:
         raise HTTPException(status_code=403, detail="Forbidden")
