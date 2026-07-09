@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel
 import os
 import smtplib
@@ -11,7 +11,24 @@ import json
 import httpx
 from app.core.otp_store import generate_code
 from app.core.otp_db import consume as otp_consume_db, delete_sync as otp_delete_db_sync, store_sync as otp_store_db_sync
-from app.core.local_auth import ensure_user_row_for_email, issue_access_token, set_user_password
+from app.core.local_auth import (
+    access_cookie_max_age,
+    auth_access_cookie_name,
+    auth_cookie_domain,
+    auth_cookie_path,
+    auth_cookie_samesite,
+    auth_cookie_secure,
+    auth_csrf_cookie_name,
+    auth_refresh_cookie_name,
+    ensure_user_row_for_email,
+    issue_access_token,
+    issue_refresh_token,
+    new_csrf_token,
+    refresh_cookie_max_age,
+    revoke_refresh_token,
+    set_user_password,
+    store_refresh_token,
+)
 from urllib.parse import quote_plus
 import secrets
 
@@ -196,10 +213,13 @@ def _smtp_send(to_email: str, subject: str, html_body: str, text_body: str) -> N
             for p in ports:
                 try:
                     print(
-                        f"[OTP] SMTP send start to={to_email} host={host} port={p} ssl=False starttls={use_starttls} attempt={attempt+1}/{retries+1}"
+                        f"[OTP] SMTP send start to={to_email} host={host} port={p} ssl={use_ssl} starttls={use_starttls} attempt={attempt+1}/{retries+1}"
                     )
                     with _smtp_lock:
-                        smtp = smtplib.SMTP(host, p, timeout=timeout)
+                        if use_ssl:
+                            smtp = smtplib.SMTP_SSL(host, p, timeout=timeout, context=tls_ctx)
+                        else:
+                            smtp = smtplib.SMTP(host, p, timeout=timeout)
                         with smtp:
                             smtp.ehlo_or_helo_if_needed()
                             if use_starttls:
@@ -311,8 +331,40 @@ async def send_otp(body: SendOtpBody):
             _send_next_allowed.pop(email, None)
         raise HTTPException(status_code=503, detail="OTP storage unavailable")
 
+def _set_auth_cookies(response: Response, *, access_token: str, refresh_token: str, csrf_token: str) -> None:
+    cookie_kwargs = {
+        "httponly": True,
+        "secure": auth_cookie_secure(),
+        "samesite": auth_cookie_samesite(),
+        "path": auth_cookie_path(),
+        "domain": auth_cookie_domain(),
+    }
+    response.set_cookie(
+        key=auth_access_cookie_name(),
+        value=access_token,
+        max_age=access_cookie_max_age(),
+        **cookie_kwargs,
+    )
+    response.set_cookie(
+        key=auth_refresh_cookie_name(),
+        value=refresh_token,
+        max_age=refresh_cookie_max_age(),
+        **cookie_kwargs,
+    )
+    response.set_cookie(
+        key=auth_csrf_cookie_name(),
+        value=csrf_token,
+        max_age=refresh_cookie_max_age(),
+        httponly=False,
+        secure=auth_cookie_secure(),
+        samesite=auth_cookie_samesite(),
+        path=auth_cookie_path(),
+        domain=auth_cookie_domain(),
+    )
+
+
 @router.post("/otp/verify")
-async def verify_otp(body: VerifyOtpBody):
+async def verify_otp(body: VerifyOtpBody, response: Response):
     email = _normalize_email(body.email)
     
     # Run OTP verification
@@ -343,6 +395,14 @@ async def verify_otp(body: VerifyOtpBody):
             detail="Local auth is not configured (apply backend/sql/local_auth.sql)",
         )
     access_token = issue_access_token(user_id=user_id, email=email)
+    refresh_token = issue_refresh_token(user_id=user_id, email=email)
+    await store_refresh_token(user_id=user_id, refresh_token=refresh_token)
+    _set_auth_cookies(
+        response,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        csrf_token=new_csrf_token(),
+    )
     return {"ok": True, "access_token": access_token, "token_type": "bearer", "user_id": user_id, "email": email}
 
 
@@ -431,7 +491,7 @@ async def _get_user_id_by_email_or_sync_from_supabase(email: str) -> str:
 
 
 @router.post("/reset/confirm")
-async def reset_confirm(body: ResetConfirmBody):
+async def reset_confirm(body: ResetConfirmBody, response: Response):
     email = _normalize_email(body.email)
     token = str(body.token or "").strip()
     if not token:
@@ -444,4 +504,12 @@ async def reset_confirm(body: ResetConfirmBody):
     if not ok:
         raise HTTPException(status_code=500, detail="Local auth is not configured (apply backend/sql/local_auth.sql)")
     access_token = issue_access_token(user_id=user_id, email=email)
+    refresh_token = issue_refresh_token(user_id=user_id, email=email)
+    await store_refresh_token(user_id=user_id, refresh_token=refresh_token)
+    _set_auth_cookies(
+        response,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        csrf_token=new_csrf_token(),
+    )
     return {"ok": True, "access_token": access_token, "token_type": "bearer", "user_id": user_id, "email": email}

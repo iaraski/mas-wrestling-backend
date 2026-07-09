@@ -89,6 +89,9 @@ class Competition(CompetitionBase):
     created_at: datetime
     categories: List[Category] = []
     location_name: Optional[str] = None
+    can_edit: Optional[bool] = None
+    can_apply: Optional[bool] = None
+    access_scope: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -124,3 +127,49 @@ class Application(ApplicationBase):
 
     class Config:
         from_attributes = True
+
+
+class AdminCreateAthleteApplication(BaseModel):
+    category_id: UUID
+    full_name: str
+    city: str
+    location_id: UUID
+    coach_name: str
+    birth_date: str
+    gender: Optional[str] = None
+    series: Optional[str] = None
+    number: Optional[str] = None
+    issued_by: Optional[str] = None
+    issue_date: Optional[str] = None
+    rank: str
+    photo_url: str
+    passport_scan_url: Optional[str] = None
+    declared_weight: Optional[float] = None
+    actual_weight: Optional[float] = None
+
+
+class AdminUpdateAthleteProfile(BaseModel):
+    full_name: str
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    city: str
+    location_id: UUID
+    coach_name: str
+    birth_date: Optional[str] = None
+    gender: Optional[str] = None
+    series: Optional[str] = None
+    number: Optional[str] = None
+    issued_by: Optional[str] = None
+    issue_date: Optional[str] = None
+    rank: Optional[str] = None
+    photo_url: Optional[str] = None
+    passport_scan_url: Optional[str] = None
+
+
+class AdminApplyAthleteToCategory(BaseModel):
+    athlete_id: UUID
+    category_id: UUID
+
+
+class PassportVerifyUpdate(BaseModel):
+    is_verified: bool

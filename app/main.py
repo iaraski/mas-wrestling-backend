@@ -9,13 +9,19 @@ import asyncio
 from datetime import datetime
 from app.core.cache import cache
 from app.core.db import init_db
+from app.core.local_auth import (
+    auth_access_cookie_name,
+    auth_csrf_cookie_name,
+    auth_csrf_header_name,
+    auth_refresh_cookie_name,
+)
 from app.core.rest import rest_get
 
 APP_DEBUG = os.getenv("APP_DEBUG") == "1"
 LEGACY_EXECUTION_ENABLED = os.getenv("LEGACY_EXECUTION_ENABLED") == "1"
 
 # Import routers
-from app.routers import competition, application, brackets, user, locations, bouts, auth, live
+from app.routers import competition, application, application_media, application_admin, application_review, brackets, user, user_staff, user_admin, user_profile, user_debug, locations, bouts, auth, live
 
 async def _warm_cache():
     try:
@@ -114,6 +120,25 @@ async def add_process_time_header(request: Request, call_next):
     start_time = time.time()
     if APP_DEBUG:
         print(f"INCOMING: {request.method} {request.url.path}")
+
+    access_cookie = request.cookies.get(auth_access_cookie_name())
+    refresh_cookie = request.cookies.get(auth_refresh_cookie_name())
+    csrf_cookie = request.cookies.get(auth_csrf_cookie_name())
+
+    if request.method.upper() not in {"GET", "HEAD", "OPTIONS"} and request.url.path != "/api/v1/auth/login":
+        if access_cookie or refresh_cookie:
+            csrf_header = request.headers.get(auth_csrf_header_name())
+            if not csrf_cookie or not csrf_header or csrf_header != csrf_cookie:
+                process_time = time.time() - start_time
+                resp = _error_json(403, request, "CSRF validation failed")
+                resp.headers["X-Process-Time"] = str(process_time)
+                return resp
+
+    if "authorization" not in request.headers:
+        if access_cookie:
+            headers = list(request.scope.get("headers") or [])
+            headers.append((b"authorization", f"Bearer {access_cookie}".encode("latin-1")))
+            request.scope["headers"] = headers
     
     try:
         response = await call_next(request)
@@ -153,7 +178,14 @@ try:
     app.include_router(certificates.router, prefix="/api/v1")
     app.include_router(competition.router, prefix="/api/v1")
     app.include_router(application.router, prefix="/api/v1")
+    app.include_router(application_media.router, prefix="/api/v1")
+    app.include_router(application_admin.router, prefix="/api/v1")
+    app.include_router(application_review.router, prefix="/api/v1")
     app.include_router(user.router, prefix="/api/v1")
+    app.include_router(user_staff.router, prefix="/api/v1")
+    app.include_router(user_admin.router, prefix="/api/v1")
+    app.include_router(user_profile.router, prefix="/api/v1")
+    app.include_router(user_debug.router, prefix="/api/v1")
     app.include_router(locations.router, prefix="/api/v1")
     app.include_router(auth.router, prefix="/api/v1")
     from app.routers import auth_custom

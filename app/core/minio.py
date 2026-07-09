@@ -26,13 +26,14 @@ def _client():
     if _s3 is None:
         if not (MINIO_ENDPOINT and MINIO_ACCESS_KEY and MINIO_SECRET_KEY and MINIO_BUCKET):
             raise RuntimeError("MinIO env is not configured (MINIO_ENDPOINT/MINIO_ACCESS_KEY/MINIO_SECRET_KEY/MINIO_BUCKET)")
+        # Local/system HTTP proxy can break direct S3-compatible uploads to MinIO.
         _s3 = boto3.client(
             "s3",
             endpoint_url=MINIO_ENDPOINT,
             aws_access_key_id=MINIO_ACCESS_KEY,
             aws_secret_access_key=MINIO_SECRET_KEY,
             region_name=os.getenv("MINIO_REGION") or "us-east-1",
-            config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+            config=Config(signature_version="s3v4", s3={"addressing_style": "path"}, proxies={}),
         )
     return _s3
 

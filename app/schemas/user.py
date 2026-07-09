@@ -35,6 +35,34 @@ class AdminCreate(BaseModel):
     role_codes: List[str]
     location_id: Optional[UUID] = None
 
+
+class AdminAthleteUpdate(BaseModel):
+    full_name: Optional[str] = None
+    phone: Optional[str] = None
+    city: Optional[str] = None
+    location_id: Optional[UUID] = None
+    coach_name: Optional[str] = None
+    birth_date: Optional[date] = None
+    gender: Optional[str] = None
+    series: Optional[str] = None
+    number: Optional[str] = None
+    issued_by: Optional[str] = None
+    issue_date: Optional[date] = None
+    rank: Optional[str] = None
+    photo_url: Optional[str] = None
+    passport_scan_url: Optional[str] = None
+
+
+class EditableUpdate(BaseModel):
+    editable: bool
+
+
+class AthleteDetailsUpdate(BaseModel):
+    birth_date: Optional[date] = None
+    rank: Optional[str] = None
+    photo_url: Optional[str] = None
+    gender: Optional[str] = None
+
 class ProfileBase(BaseModel):
     full_name: str
     phone: Optional[str] = None

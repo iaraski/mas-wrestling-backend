@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Header
 from fastapi.responses import StreamingResponse
 from typing import List
 from uuid import UUID
@@ -10,11 +10,18 @@ import httpx
 import anyio
 from PIL import Image, ImageDraw, ImageFont
 from app.core.rest import rest_get, rest_delete, rest_post, rest_patch
+from app.competitions import (
+    filter_competitions_for_user,
+    get_user_competition_access_context,
+    require_can_create_competition,
+    require_can_edit_competition,
+)
 from app.schemas.competition import Competition, CompetitionCreate, CompetitionUpdate
 from app.core.cache import cache
 from app.core.db import get_db, tables
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from app.core.local_auth import get_user_id_from_bearer
 
 router = APIRouter(prefix="/competitions", tags=["competitions"])
 
@@ -65,56 +72,74 @@ async def _execute(query, *, retries: int = 2):
             await anyio.sleep(0.2 * (attempt + 1))
 
 @router.get("/active")
-async def get_active_competitions():
+async def get_active_competitions(authorization: str | None = Header(default=None)):
     try:
         cache_key = "competitions:active"
         cached = cache.get(cache_key)
         if cached is not None:
-            return cached
+            data = cached
+        else:
+            params = {
+                "select": "id,name,scale,type,location_id,mandate_start_date,mandate_end_date,start_date,end_date,preview_url,description,mats_count,categories:competition_categories(id,competition_id,gender,age_min,age_max,weight_min,weight_max,competition_day,mandate_day)",
+                "end_date": f"gte.{datetime.now().isoformat()}",
+                "order": "start_date.asc",
+                "limit": "50",
+            }
+            resp = await rest_get("competitions", params, write=False)
+            data = resp.json()
+            cache.set(cache_key, data, ttl_seconds=60.0)
 
-        params = {
-            "select": "id,name,scale,type,location_id,mandate_start_date,mandate_end_date,start_date,end_date,preview_url,description,mats_count,categories:competition_categories(id,competition_id,gender,age_min,age_max,weight_min,weight_max,competition_day,mandate_day)",
-            "end_date": f"gte.{datetime.now().isoformat()}",
-            "order": "start_date.asc",
-            "limit": "50",
-        }
-        resp = await rest_get("competitions", params, write=False)
-        data = resp.json()
-        cache.set(cache_key, data, ttl_seconds=60.0)
+        if authorization:
+            try:
+                user_id = await get_user_id_from_bearer(authorization)
+                ctx = await get_user_competition_access_context(user_id)
+                data = await filter_competitions_for_user(data if isinstance(data, list) else [], ctx)
+            except Exception:
+                pass
         return data
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Database unavailable: {repr(e)}")
 
 @router.get("/", response_model=List[Competition])
-async def get_competitions():
+async def get_competitions(authorization: str | None = Header(default=None)):
     # Получаем соревнования с их категориями и названием локации
     try:
         cache_key = "competitions:list"
         cached = cache.get(cache_key)
         if cached is not None:
-            return cached
-
-        params = {"select": "*,categories:competition_categories(*),locations(name)"}
-        resp = await rest_get("competitions", params, write=False)
-        rows = resp.json()
+            rows = cached
+        else:
+            params = {"select": "*,categories:competition_categories(*),locations(name)"}
+            resp = await rest_get("competitions", params, write=False)
+            rows = resp.json()
+            # Добавляем location_name в результат
+            data = []
+            for comp in rows:
+                if comp.get("locations"):
+                    comp["location_name"] = comp["locations"]["name"]
+                data.append(comp)
+            cache.set(cache_key, data, ttl_seconds=15.0)
+            rows = data
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Database unavailable: {repr(e)}")
-    
-    # Добавляем location_name в результат
-    data = []
-    for comp in rows:
-        if comp.get("locations"):
-            comp["location_name"] = comp["locations"]["name"]
-        data.append(comp)
-        
-    cache.set(cache_key, data, ttl_seconds=15.0)
+
+    data = rows if isinstance(rows, list) else []
+    if authorization:
+        user_id = await get_user_id_from_bearer(authorization)
+        ctx = await get_user_competition_access_context(user_id)
+        data = await filter_competitions_for_user(data, ctx)
     return data
 
 @router.post("/", response_model=Competition)
-async def create_competition(comp: CompetitionCreate):
+async def create_competition(comp: CompetitionCreate, authorization: str | None = Header(default=None)):
     try:
+        user_id = await get_user_id_from_bearer(authorization)
+        ctx = await get_user_competition_access_context(user_id)
         # 1. Создаем соревнование
         comp_data = comp.model_dump(exclude={"categories", "secretaries"})
+        await require_can_create_competition(ctx, comp_data)
         if not comp_data.get("preview_url"):
             comp_data.pop("preview_url", None)
         
@@ -188,37 +213,63 @@ async def create_competition(comp: CompetitionCreate):
             
         cache.invalidate_prefix("competitions:")
         return {**new_comp, "categories": final_categories}
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"[Backend] ERROR in create_competition: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/{comp_id}", response_model=Competition)
-async def get_competition(comp_id: UUID):
+async def get_competition(comp_id: UUID, authorization: str | None = Header(default=None)):
     try:
         cache_key = f"competitions:detail:{str(comp_id)}"
         cached = cache.get(cache_key)
         if cached is not None:
-            return cached
+            data = cached
+        else:
+            resp = await rest_get(
+                "competitions",
+                {"select": "*,categories:competition_categories(*),locations(name)", "id": f"eq.{str(comp_id)}", "limit": "1"},
+                write=False,
+            )
+            rows = resp.json()
+            if not isinstance(rows, list) or not rows:
+                raise HTTPException(status_code=404, detail="Competition not found")
+            data = rows[0]
+            if data.get("locations"):
+                data["location_name"] = data["locations"]["name"]
+            cache.set(cache_key, data, ttl_seconds=15.0)
 
-        resp = await rest_get(
-            "competitions",
-            {"select": "*,categories:competition_categories(*)", "id": f"eq.{str(comp_id)}", "limit": "1"},
-            write=False,
-        )
-        rows = resp.json()
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Database unavailable: {repr(e)}")
-    if not isinstance(rows, list) or not rows:
-        raise HTTPException(status_code=404, detail="Competition not found")
-    data = rows[0]
-    cache.set(cache_key, data, ttl_seconds=15.0)
+
+    if authorization:
+        user_id = await get_user_id_from_bearer(authorization)
+        ctx = await get_user_competition_access_context(user_id)
+        data = await filter_competitions_for_user([data], ctx)
+        if not data:
+            raise HTTPException(status_code=404, detail="Competition not found")
+        return data[0]
     return data
 
 @router.patch("/{comp_id}/", response_model=Competition)
 @router.patch("/{comp_id}", response_model=Competition)
-async def update_competition(comp_id: UUID, comp_update: CompetitionUpdate):
+async def update_competition(comp_id: UUID, comp_update: CompetitionUpdate, authorization: str | None = Header(default=None)):
     try:
+        user_id = await get_user_id_from_bearer(authorization)
+        ctx = await get_user_competition_access_context(user_id)
         comp_id_str = str(comp_id)
+        existing_resp = await rest_get(
+            "competitions",
+            {"select": "id,scale,location_id", "id": f"eq.{comp_id_str}", "limit": "1"},
+            write=True,
+        )
+        existing_rows = existing_resp.json()
+        existing_comp = existing_rows[0] if isinstance(existing_rows, list) and existing_rows else None
+        if not isinstance(existing_comp, dict):
+            raise HTTPException(status_code=404, detail="Competition not found")
+        await require_can_edit_competition(existing_comp, ctx)
+
         update_data = comp_update.model_dump(exclude_unset=True)
         if "preview_url" in update_data and not update_data.get("preview_url"):
             update_data.pop("preview_url", None)
@@ -233,6 +284,9 @@ async def update_competition(comp_id: UUID, comp_update: CompetitionUpdate):
                 update_data[key] = str(value)
             elif key in ["mandate_start_date", "mandate_end_date", "start_date", "end_date"]:
                 update_data[key] = _norm_datetime(value)
+
+        merged_scope = {**existing_comp, **update_data}
+        await require_can_create_competition(ctx, merged_scope)
 
         # Обновление основной таблицы соревнований
         if update_data:
@@ -393,25 +447,31 @@ async def update_competition(comp_id: UUID, comp_update: CompetitionUpdate):
                         pass
                 
         # Возвращаем обновленное соревнование
-        final_resp = await rest_get(
-            "competitions",
-            {"select": "*,categories:competition_categories(*)", "id": f"eq.{comp_id_str}", "limit": "1"},
-            write=False,
-        )
-        final_rows = final_resp.json()
-        if not isinstance(final_rows, list) or not final_rows:
-            raise HTTPException(status_code=404, detail="Competition not found")
         cache.invalidate_prefix("competitions:")
-        return final_rows[0]
-        
+        return await get_competition(comp_id, authorization=authorization)
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"[Backend] ERROR in update_competition: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.delete("/{comp_id}")
-async def delete_competition(comp_id: UUID):
+async def delete_competition(comp_id: UUID, authorization: str | None = Header(default=None)):
     cid = str(comp_id)
     try:
+        user_id = await get_user_id_from_bearer(authorization)
+        ctx = await get_user_competition_access_context(user_id)
+        existing_resp = await rest_get(
+            "competitions",
+            {"select": "id,scale,location_id", "id": f"eq.{cid}", "limit": "1"},
+            write=True,
+        )
+        existing_rows = existing_resp.json()
+        existing_comp = existing_rows[0] if isinstance(existing_rows, list) and existing_rows else None
+        if not isinstance(existing_comp, dict):
+            raise HTTPException(status_code=404, detail="Competition not found")
+        await require_can_edit_competition(existing_comp, ctx)
+
         from app.core.supabase import admin_supabase
         if not admin_supabase:
             raise HTTPException(status_code=500, detail="admin_supabase is not initialized")
@@ -426,13 +486,32 @@ async def delete_competition(comp_id: UUID):
         
         await _execute(admin_supabase.table("competitions").delete().eq("id", cid))
         cache.invalidate_prefix("competitions:")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"ok": True}
 
 @router.post("/{comp_id}/preview")
-async def upload_competition_preview(comp_id: UUID, file: UploadFile = File(...)):
+async def upload_competition_preview(
+    comp_id: UUID,
+    file: UploadFile = File(...),
+    authorization: str | None = Header(default=None),
+):
     try:
+        user_id = await get_user_id_from_bearer(authorization)
+        ctx = await get_user_competition_access_context(user_id)
+        existing_resp = await rest_get(
+            "competitions",
+            {"select": "id,scale,location_id", "id": f"eq.{str(comp_id)}", "limit": "1"},
+            write=True,
+        )
+        existing_rows = existing_resp.json()
+        existing_comp = existing_rows[0] if isinstance(existing_rows, list) and existing_rows else None
+        if not isinstance(existing_comp, dict):
+            raise HTTPException(status_code=404, detail="Competition not found")
+        await require_can_edit_competition(existing_comp, ctx)
+
         if not file.content_type or not file.content_type.startswith("image/"):
             raise HTTPException(status_code=400, detail="Only image files are supported")
 
@@ -473,6 +552,8 @@ async def upload_competition_preview(comp_id: UUID, file: UploadFile = File(...)
             raise HTTPException(status_code=500, detail=f"Failed to update preview_url: {resp.status_code} {resp.text}")
         cache.invalidate_prefix("competitions:")
         return {"preview_url": preview_url}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

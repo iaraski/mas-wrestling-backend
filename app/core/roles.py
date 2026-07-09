@@ -1,22 +1,31 @@
-from app.core.rest import rest_get
+from sqlalchemy import select as _select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.db import SessionLocal, tables
 
 
-async def get_role_codes(user_id: str) -> list[str]:
-    resp = await rest_get(
-        "user_roles",
-        {"select": "role_id", "user_id": f"eq.{str(user_id)}", "limit": "1000"},
-        write=True,
+async def get_role_codes(
+    user_id: str,
+    *,
+    session: AsyncSession | None = None,
+) -> list[str]:
+    user_roles_t = tables.get("user_roles")
+    roles_t = tables.get("roles")
+    if user_roles_t is None or roles_t is None:
+        return []
+
+    stmt = (
+        _select(roles_t.c.code)
+        .select_from(user_roles_t.join(roles_t, roles_t.c.id == user_roles_t.c.role_id))
+        .where(user_roles_t.c.user_id == str(user_id))
+        .limit(1000)
     )
-    rows = resp.json()
-    if not isinstance(rows, list):
-        return []
-    role_ids = [str(r.get("role_id")) for r in rows if isinstance(r, dict) and r.get("role_id")]
-    if not role_ids:
-        return []
-    ids_expr = f"in.({','.join(role_ids)})"
-    r2 = await rest_get("roles", {"select": "code,id", "id": ids_expr, "limit": "1000"}, write=True)
-    roles = r2.json()
-    if not isinstance(roles, list):
-        return []
-    return [str(r.get("code")) for r in roles if isinstance(r, dict) and r.get("code")]
 
+    if session is not None:
+        res = await session.execute(stmt)
+        rows = res.mappings().all()
+    else:
+        async with SessionLocal() as own_session:
+            res = await own_session.execute(stmt)
+            rows = res.mappings().all()
+    return [str(r.get("code")) for r in rows if r.get("code")]
