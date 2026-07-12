@@ -124,9 +124,15 @@ async def add_process_time_header(request: Request, call_next):
     access_cookie = request.cookies.get(auth_access_cookie_name())
     refresh_cookie = request.cookies.get(auth_refresh_cookie_name())
     csrf_cookie = request.cookies.get(auth_csrf_cookie_name())
+    authorization_header = request.headers.get("authorization")
+    has_bearer_authorization = bool(
+        authorization_header and authorization_header.lower().startswith("bearer ")
+    )
 
     if request.method.upper() not in {"GET", "HEAD", "OPTIONS"} and request.url.path != "/api/v1/auth/login":
-        if access_cookie or refresh_cookie:
+        # CSRF is required for cookie-authenticated requests, but mobile clients
+        # use explicit Bearer tokens and should not be blocked by cookie checks.
+        if (access_cookie or refresh_cookie) and not has_bearer_authorization:
             csrf_header = request.headers.get(auth_csrf_header_name())
             if not csrf_cookie or not csrf_header or csrf_header != csrf_cookie:
                 process_time = time.time() - start_time
