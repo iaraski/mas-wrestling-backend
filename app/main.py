@@ -19,6 +19,13 @@ from app.core.rest import rest_get
 
 APP_DEBUG = os.getenv("APP_DEBUG") == "1"
 LEGACY_EXECUTION_ENABLED = os.getenv("LEGACY_EXECUTION_ENABLED") == "1"
+CSRF_EXEMPT_PATHS = {
+    "/api/v1/auth/login",
+    "/api/v1/auth-custom/otp/send",
+    "/api/v1/auth-custom/otp/verify",
+    "/api/v1/auth-custom/reset/send",
+    "/api/v1/auth-custom/reset/confirm",
+}
 
 # Import routers
 from app.routers import competition, application, application_media, application_admin, application_review, brackets, user, user_staff, user_admin, user_profile, user_debug, locations, bouts, auth, live
@@ -129,7 +136,7 @@ async def add_process_time_header(request: Request, call_next):
         authorization_header and authorization_header.lower().startswith("bearer ")
     )
 
-    if request.method.upper() not in {"GET", "HEAD", "OPTIONS"} and request.url.path != "/api/v1/auth/login":
+    if request.method.upper() not in {"GET", "HEAD", "OPTIONS"} and request.url.path not in CSRF_EXEMPT_PATHS:
         # CSRF is required for cookie-authenticated requests, but mobile clients
         # use explicit Bearer tokens and should not be blocked by cookie checks.
         if (access_cookie or refresh_cookie) and not has_bearer_authorization:
